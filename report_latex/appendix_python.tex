@@ -1,0 +1,1039 @@
+
+\subsection{train_cnn.py}
+\begin{lstlisting}[language=Python]
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+# ─────────────────────────────────────────────
+#  3-CLASS MODEL TRAINER: Cat / Dog / Human
+# ─────────────────────────────────────────────
+
+print("Loading images from Doglets/...")
+dataset = tf.keras.utils.image_dataset_from_directory(
+    "Doglets",
+    color_mode="grayscale",
+    image_size=(32, 32),
+    batch_size=32,
+    shuffle=True,
+    seed=42
+)
+
+class_names = dataset.class_names
+print(f"Class mapping: {list(enumerate(class_names))}")
+
+# Split off 20% for validation
+total_batches = tf.data.experimental.cardinality(dataset).numpy()
+val_size   = int(total_batches * 0.2)
+train_size = total_batches - val_size
+
+train_ds = dataset.take(train_size).cache().prefetch(tf.data.AUTOTUNE)
+val_ds   = dataset.skip(train_size).cache().prefetch(tf.data.AUTOTUNE)
+
+# ─────────────────────────────────────────────
+#  Build the brain (Updated with Normalization)
+# ─────────────────────────────────────────────
+model = models.Sequential([
+    layers.Input(shape=(32, 32, 1)),
+    layers.Rescaling(1./255), # Normalizes 0-255 pixels to 0.0-1.0
+    
+    layers.Conv2D(16, (3, 3), activation='relu', padding='same'),
+    layers.MaxPooling2D((2, 2)),
+    
+    layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+    layers.MaxPooling2D((2, 2)),
+    
+    layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+    layers.MaxPooling2D((2, 2)),
+    
+    layers.Flatten(),
+    layers.Dense(32, activation='relu'),
+    layers.Dense(3, activation='softmax')
+])
+
+model.compile(
+    optimizer='adam',
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+# ─────────────────────────────────────────────
+#  Train (Increased to 30 Epochs for convergence)
+# ─────────────────────────────────────────────
+print("\nStarting training (30 epochs)...")
+model.fit(train_ds, validation_data=val_ds, epochs=50)
+
+model.save("tiny_ai_brain.h5")
+print("\nTraining complete! Saved as tiny_ai_brain.h5")
+\end{lstlisting}
+
+\subsection{export_weights.py}
+\begin{lstlisting}[language=Python]
+import os
+import numpy as np
+import tensorflow as tf
+
+# ─────────────────────────────────────────────
+# 1. Configuration & Helper Functions
+# ─────────────────────────────────────────────
+MODEL_PATH = "tiny_ai_brain.h5"
+OUTPUT_DIR = "export_q88"
+
+def quantize_q8_8(x_float):
+    """Converts a float array to Q8.8 fixed-point 16-bit integers."""
+    x_int = np.round(x_float * 256.0)
+    x_clipped = np.clip(x_int, -32768, 32767)
+    return x_clipped.astype(np.int16)
+
+def to_hex_16bit(val):
+    """Converts an int16 to a 4-char hex string (2's complement)."""
+    return f"{int(val) & 0xFFFF:04X}"
+
+def write_mem_file(filepath, data_1d):
+    """Writes a .mem file for Vivado simulation ($readmemh)."""
+    with open(filepath, 'w') as f:
+        for val in data_1d:
+            f.write(to_hex_16bit(val) + "\n")
+
+def write_coe_file(filepath, data_1d):
+    """Writes a .coe file for Xilinx Block Memory Generator IP."""
+    with open(filepath, 'w') as f:
+        f.write("memory_initialization_radix=16;\n")
+        f.write("memory_initialization_vector=\n")
+        # Write all but the last with a comma
+        for val in data_1d[:-1]:
+            f.write(to_hex_16bit(val) + ",\n")
+        # Write the last one with a semicolon
+        f.write(to_hex_16bit(data_1d[-1]) + ";\n")
+
+# ─────────────────────────────────────────────
+# 2. Setup & Model Loading
+# ─────────────────────────────────────────────
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+print(f"Loading model: {MODEL_PATH}...")
+model = tf.keras.models.load_model(MODEL_PATH)
+
+conv_counter = 1
+dense_counter = 1
+
+# ─────────────────────────────────────────────
+# 3. Layer Iteration & Extraction
+# ─────────────────────────────────────────────
+for layer in model.layers:
+    weights_list = layer.get_weights()
+    if len(weights_list) == 0:
+        continue # Skip Flatten, MaxPooling, etc.
+
+    w_float = weights_list[0]
+    b_float = weights_list[1]
+    
+    layer_type = layer.__class__.__name__
+    
+    if layer_type == "Conv2D":
+        name = f"conv{conv_counter}"
+        conv_counter += 1
+        
+        # Keras format: (H, W, IC, OC) -> FPGA format: (OC, IC, H, W)
+        w_float_transposed = np.transpose(w_float, (3, 2, 0, 1))
+        
+        # Quantize
+        w_q88 = quantize_q8_8(w_float_transposed)
+        b_q88 = quantize_q8_8(b_float)
+        
+    elif layer_type == "Dense":
+        name = f"dense{dense_counter}"
+        dense_counter += 1
+        
+        # Initial quantization
+        w_q88_base = quantize_q8_8(w_float)
+        b_q88_base = quantize_q8_8(b_float)
+        
+        # Hardware formatting: (Passes, Inputs, Parallel_MACs)
+        PARALLEL_MACS = 8
+        in_size, out_size = w_q88_base.shape
+        num_passes = int(np.ceil(out_size / PARALLEL_MACS))
+        pad_cols = (num_passes * PARALLEL_MACS) - out_size
+        
+        # Pad outputs with zeros if not a perfect multiple of 8 (e.g., Dense2)
+        if pad_cols > 0:
+            w_q88_padded = np.pad(w_q88_base, ((0,0), (0, pad_cols)), mode='constant')
+            b_q88_padded = np.pad(b_q88_base, (0, pad_cols), mode='constant')
+        else:
+            w_q88_padded = w_q88_base
+            b_q88_padded = b_q88_base
+            
+        # Reshape to (Inputs, Passes, MACs), then transpose to (Passes, Inputs, MACs)
+        w_reshaped = w_q88_padded.reshape((in_size, num_passes, PARALLEL_MACS))
+        w_hw_format = w_reshaped.transpose((1, 0, 2))
+        
+        # Assign to w_q88 / b_q88 so the rest of the script exports them correctly
+        w_q88 = w_hw_format
+        b_q88 = b_q88_padded
+        
+    else:
+        print(f"Skipping unsupported layer with weights: {layer_type}")
+        continue
+        
+    # Flatten arrays for 1D file writing
+    w_flat = w_q88.flatten()
+    b_flat = b_q88.flatten()
+
+    print(f"Exporting {name}: Weights shape {w_q88.shape} ({len(w_flat)} words), Biases shape {b_q88.shape}")
+
+    # 1. Save .npy for the Golden Python Model
+    np.save(os.path.join(OUTPUT_DIR, f"{name}_weights.npy"), w_q88)
+    np.save(os.path.join(OUTPUT_DIR, f"{name}_biases.npy"), b_q88)
+    
+    # 2. Save .mem files (for VHDL simulation)
+    write_mem_file(os.path.join(OUTPUT_DIR, f"{name}_weights.mem"), w_flat)
+    write_mem_file(os.path.join(OUTPUT_DIR, f"{name}_biases.mem"), b_flat)
+    
+    # 3. Save .coe files (for Vivado BRAM Synthesis)
+    write_coe_file(os.path.join(OUTPUT_DIR, f"{name}_weights.coe"), w_flat)
+    write_coe_file(os.path.join(OUTPUT_DIR, f"{name}_biases.coe"), b_flat)
+
+print(f"\nSuccess! All weights exported to the '{OUTPUT_DIR}/' directory.")
+\end{lstlisting}
+
+\subsection{golden_model.py}
+\begin{lstlisting}[language=Python]
+import numpy as np
+import os
+from PIL import Image
+
+# golden_model.py
+# Master Plan Phase 1: Integer-Only Reference Model
+# Updated: Input pixels are now properly scaled to Q8.8 to match spi.py hardware inputs!
+
+# ─────────────────────────────────────────────
+#  Phase 1.1: Core Arithmetic Engine (Bit-Exact Q8.8)
+# ─────────────────────────────────────────────
+def dsp48_mac(inputs, weights, bias, apply_relu=True):
+    """Simulates the FPGA DSP48E1 48-bit MAC engine."""
+    accumulator = 0 
+    
+    for i, w in zip(inputs, weights):
+        accumulator += int(i) * int(w)
+        
+    accumulator += (int(bias) << 8)
+    result = accumulator >> 8
+    
+    if result > 32767:
+        result = 32767
+    elif result < -32768:
+        result = -32768
+        
+    if apply_relu and result < 0:
+        result = 0
+        
+    return result
+
+# ─────────────────────────────────────────────
+#  Phase 1.2: Spatial & Dense Operations
+# ─────────────────────────────────────────────
+def conv2d_valid(input_map, weights, biases, apply_relu=True):
+    in_h = len(input_map)
+    in_w = len(input_map[0])
+    in_c = len(input_map[0][0])
+    out_c = len(weights)
+    
+    out_h = in_h - 2
+    out_w = in_w - 2
+    
+    out_map = [[[0 for _ in range(out_c)] for _ in range(out_w)] for _ in range(out_h)]
+    
+    for y in range(out_h):
+        for x in range(out_w):
+            for oc in range(out_c):
+                window_flat = []
+                kernel_flat = []
+                for ic in range(in_c):
+                    for dy in range(3):
+                        for dx in range(3):
+                            window_flat.append(input_map[y + dy][x + dx][ic])
+                            kernel_flat.append(weights[oc][ic][dy][dx])
+                            
+                out_map[y][x][oc] = dsp48_mac(window_flat, kernel_flat, biases[oc], apply_relu)
+    return out_map
+
+def padder2d(input_map):
+    in_h = len(input_map)
+    in_w = len(input_map[0])
+    in_c = len(input_map[0][0])
+    out_h = in_h + 2
+    out_w = in_w + 2
+    out_map = [[[0 for _ in range(in_c)] for _ in range(out_w)] for _ in range(out_h)]
+    for y in range(in_h):
+        for x in range(in_w):
+            for c in range(in_c):
+                out_map[y + 1][x + 1][c] = input_map[y][x][c]
+    return out_map
+
+def max_pool2d_2x2(input_map):
+    in_h = len(input_map)
+    in_w = len(input_map[0])
+    in_c = len(input_map[0][0])
+    out_h = in_h // 2
+    out_w = in_w // 2
+    out_map = [[[0 for _ in range(in_c)] for _ in range(out_w)] for _ in range(out_h)]
+    for y in range(out_h):
+        for x in range(out_w):
+            for c in range(in_c):
+                val1 = input_map[y*2][x*2][c]
+                val2 = input_map[y*2][x*2 + 1][c]
+                val3 = input_map[y*2 + 1][x*2][c]
+                val4 = input_map[y*2 + 1][x*2 + 1][c]
+                out_map[y][x][c] = max(val1, val2, val3, val4)
+    return out_map
+
+def flatten3d(input_map):
+    out_flat = []
+    for y in range(len(input_map)):
+        for x in range(len(input_map[0])):
+            for c in range(len(input_map[0][0])):
+                out_flat.append(input_map[y][x][c])
+    return out_flat
+
+def dense_layer(input_vector, weights, biases, out_c, apply_relu=True):
+    """
+    Computes Dense output using hardware-aligned transposed weights:
+    weights shape: (num_passes, in_size, parallel_macs)
+    """
+    in_size = len(input_vector)
+    parallel_macs = len(weights[0][0]) # Expected to be 8 based on hardware
+    
+    out_vector = [0] * out_c
+    
+    for oc in range(out_c):
+        # Calculate exactly where this neuron's weights are in the 3D hardware matrix
+        pass_idx = oc // parallel_macs
+        mac_idx = oc % parallel_macs
+        
+        # Extract the weight vector for this specific output neuron across all inputs
+        weights_flat = [weights[pass_idx][ic][mac_idx] for ic in range(in_size)]
+        
+        # Run through the bit-exact MAC
+        out_vector[oc] = dsp48_mac(input_vector, weights_flat, biases[oc], apply_relu)
+        
+    return out_vector
+
+# ─────────────────────────────────────────────
+#  Phase 1.3: Full Network Forward Pass
+# ─────────────────────────────────────────────
+def load_q88_weights(layer_name):
+    w = np.load(f"export_q88/{layer_name}_weights.npy").tolist()
+    b = np.load(f"export_q88/{layer_name}_biases.npy").tolist()
+    return w, b
+
+def run_full_inference(img_path):
+    print(f"\n--- Starting Full Hardware Simulation for: {img_path} ---")
+    
+    # 1. Load Image
+    img = Image.open(img_path).convert('L').resize((32, 32))
+    pixel_data = np.array(img, dtype=int)
+    
+    # 2. Pi-Side Padding (32x32 -> 34x34)
+    padded_img = np.pad(pixel_data, pad_width=1, mode='constant', constant_values=0)
+    
+    # --- THE FIX: SCALE TO Q8.8 ---
+    # Keras trained with 0.0-1.0. Our spi.py divides by 255.0 and multiplies by 256.0.
+    # We use np.round() and cast to int to exactly mimic the hardware payload.
+    hw_map = [[[int(np.round((padded_img[y][x] / 255.0) * 256.0))] for x in range(34)] for y in range(34)]
+    
+    # 3. Load All Weights 
+    print("Loading exported weights...")
+    try:
+        c1_w, c1_b = load_q88_weights("conv1")
+        c2_w, c2_b = load_q88_weights("conv2")
+        c3_w, c3_b = load_q88_weights("conv3")
+        d1_w, d1_b = load_q88_weights("dense1")
+        d2_w, d2_b = load_q88_weights("dense2")
+    except FileNotFoundError:
+        print("Error: Could not find weight files. Run export_weights.py first.")
+        return None
+
+    # 4. Execute Pipeline
+    print("Running Pipeline...")
+    x = conv2d_valid(hw_map, c1_w, c1_b, apply_relu=True)
+    x = max_pool2d_2x2(x)
+    x = padder2d(x)
+    x = conv2d_valid(x, c2_w, c2_b, apply_relu=True)
+    x = max_pool2d_2x2(x)
+    x = padder2d(x)
+    x = conv2d_valid(x, c3_w, c3_b, apply_relu=True)
+    x = max_pool2d_2x2(x)
+    x = flatten3d(x)
+    
+    # Updated to pass out_c parameter
+    x = dense_layer(x, d1_w, d1_b, out_c=32, apply_relu=True)
+    logits = dense_layer(x, d2_w, d2_b, out_c=3, apply_relu=False) 
+    
+    return logits
+
+if __name__ == "__main__":
+    # Test a Dog image this time!
+    test_image = "Doglets/Human/9_Press_Conference_Press_Conference_9_466.jpg"  # Change to your test image path
+    
+    if os.path.exists(test_image):
+        final_logits = run_full_inference(test_image)
+        if final_logits:
+            print("\n==================================")
+            print(" FPGA SIMULATION COMPLETE")
+            print("==================================")
+            print(f" Raw Q8.8 Logits : {final_logits}")
+            print(f" Predicted Class : {['Cat', 'Dog', 'Human'][np.argmax(final_logits)]}")
+            print("==================================")
+    else:
+        print(f"FAIL: Could not find image at '{test_image}'.")
+
+# ... (Keep all your existing golden_model.py functions above this!)
+
+class GoldenModel:
+    def __init__(self):
+        self.classes = ["Cat", "Dog", "Human"]
+
+    def predict(self, image_path):
+        logits = run_full_inference(image_path)
+        if logits is None:
+            return "Error"
+        # Return the string name of the winning class
+        return self.classes[np.argmax(logits)]
+\end{lstlisting}
+
+\subsection{cpu.py}
+\begin{lstlisting}[language=Python]
+import sys
+import time
+import threading
+import numpy as np
+import tensorflow as tf
+import psutil
+from scapy.all import conf, Ether, IP, UDP, sendp
+
+# =========================================================================
+# 1. NETWORK & INTERFACE CONFIGURATION
+# =========================================================================
+INTERFACE = "Realtek PCIe GbE Family Controller" 
+
+PC_MAC = "c8:53:09:fa:62:38" 
+FPGA_MAC = "e8:6a:64:e7:e8:30"
+PC_IP = "192.168.1.10"
+FPGA_IP = "192.168.1.20"
+
+# =========================================================================
+# 2. HARDWARE & BENCHMARK DESIGN CONSTANTS
+# =========================================================================
+FPGA_CLOCK_MHZ = 100.0   # 10 ns clock period
+NUM_CLASSES = 3          # 3 target classification layers
+RESPONSE_LEN = NUM_CLASSES * 2  # 16-bit elements (6 bytes total)
+
+# Hardcoded true Turbo Boost reference clock for your i7-14700HX P-cores
+MANUAL_CPU_FREQ_MHZ = 5200.0
+
+# Fixed compensation factor for OS network stack driver traversal
+NETWORK_LATENCY_OFFSET = 0.002 
+
+# =========================================================================
+# 3. FILE PATHS
+# =========================================================================
+INPUT_FILE = "cat_0_input.hex"
+EXPECTED_OUTPUT_FILE = "cat_11_logits.hex"
+TFLITE_MODEL = "tiny_ai_brain.tflite"
+
+
+class CnnEthernetTester:
+    def __init__(self):
+        self.running = True
+        self.received_logits_bytes = b""
+        
+        # Load expected testbench metrics
+        self.expected_bytes = self.read_hex_logits(EXPECTED_OUTPUT_FILE)
+        print(f"Loaded expected logits: {self.expected_bytes.hex().upper()}")
+
+        # Metric and time tracking
+        self.fpga_send_time = 0
+        self.fpga_recv_time = 0
+        self.fpga_rtt = 0
+        self.software_time = 0
+
+        # Initialize TensorFlow Lite inference engine
+        self.interpreter = tf.lite.Interpreter(model_path=TFLITE_MODEL)
+        self.interpreter.allocate_tensors()
+
+        try:
+            self.sock = conf.L2socket(iface=INTERFACE)
+        except Exception as e:
+            print(f"CRITICAL ERROR Opening Layer 2 Socket: {e}")
+            sys.exit(1)
+
+        # Spawn isolated concurrent background receiver thread
+        self.listener_thread = threading.Thread(target=self.listen_for_fpga)
+        self.listener_thread.daemon = True
+        self.listener_thread.start()
+
+    def read_hex_image(self, filepath):
+        """Extracts the lower 8 bits of pixel data to match VHDL stream layout."""
+        byte_data = bytearray()
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    byte_data.append(bytes.fromhex(line)[1])
+        return bytes(byte_data)
+
+    def read_hex_logits(self, filepath):
+        """Reads expected 16-bit logits maintaining full precision window."""
+        byte_data = bytearray()
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    byte_data.extend(bytes.fromhex(line))
+        return bytes(byte_data[:RESPONSE_LEN])
+
+    def run_software_inference(self, input_bytes):
+        print("\n--- RUNNING SOFTWARE INFERENCE ---")
+        input_details = self.interpreter.get_input_details()
+        output_details = self.interpreter.get_output_details()
+        input_shape = input_details[0]['shape']
+
+        try:
+            # Parse 1156 bytes into a 34x34 padded array
+            padded_array = np.frombuffer(input_bytes, dtype=np.uint8).reshape((34, 34))
+            
+            # Crop out the 1-pixel outer border to retrieve the valid 32x32 image matrix
+            cropped_array = padded_array[1:33, 1:33]
+            
+            # Normalize to [0.0, 1.0] float representation matching Q8.8 design logic
+            normalized_array = cropped_array.astype(np.float32) / 255.0
+            input_array = normalized_array.reshape(input_shape)
+            
+        except ValueError as e:
+            print(f"Matrix parsing or reshape transformation failed: {e}")
+            return
+
+        self.interpreter.set_tensor(input_details[0]['index'], input_array)
+
+        # Isolated execution timing window
+        start_time = time.perf_counter()
+        self.interpreter.invoke()
+        end_time = time.perf_counter()
+
+        self.software_time = end_time - start_time
+        software_output = self.interpreter.get_tensor(output_details[0]['index'])
+        
+        print(f"Software Execution Time: {self.software_time:.6f} seconds")
+        print(f"Software Output Array:   {software_output.flatten()}")
+
+    def listen_for_fpga(self):
+        expected_src_mac = bytes.fromhex(FPGA_MAC.replace(':', ''))
+        expected_dst_mac = bytes.fromhex(PC_MAC.replace(':', ''))
+        
+        print("Listening for FPGA response...")
+        while self.running:
+            try:
+                pkt = self.sock.recv(timeout=1)
+                if pkt:
+                    raw_bytes = bytes(pkt)
+                    
+                    if len(raw_bytes) >= 42:
+                        actual_dst = raw_bytes[0:6]
+                        actual_src = raw_bytes[6:12]
+                        
+                        if actual_dst == expected_dst_mac and actual_src == expected_src_mac:
+                            # Immediate arrival timestamp capture
+                            self.fpga_recv_time = time.perf_counter()
+                            
+                            # Bypass L2/L3 protocol headers (14 Eth + 20 IP + 8 UDP)
+                            payload = raw_bytes[42:] 
+                            
+                            if len(payload) >= RESPONSE_LEN:
+                                self.received_logits_bytes = payload[:RESPONSE_LEN]
+                                self.compare_and_exit()
+            except Exception:
+                pass 
+
+    def send_input_image(self):
+        input_payload = self.read_hex_image(INPUT_FILE)
+        print(f"Loaded {len(input_payload)} correct pixel bytes from {INPUT_FILE}")
+
+        # Compute software benchmark configuration
+        self.run_software_inference(input_payload)
+
+        # Construct frame forcing static identifiers and checksums to match VHDL simulation
+        frame = Ether(src=PC_MAC, dst=FPGA_MAC) / \
+                IP(src=PC_IP, dst=FPGA_IP, id=0, chksum=0) / \
+                UDP(sport=4660, dport=17767, chksum=0) / \
+                input_payload
+        
+        print("\n--- RUNNING HARDWARE INFERENCE ---")
+        print("Sending UDP CNN Input Data...")
+        
+        self.fpga_send_time = time.perf_counter()
+        sendp(frame, iface=INTERFACE, verbose=False)
+
+    def compare_performance(self):
+        print("\n--- PERFORMANCE & CLOCK SCALING ANALYSIS ---")
+        
+        # Calculate true hardware execution window 
+        self.fpga_rtt = self.fpga_recv_time - self.fpga_send_time
+        hw_time_adjusted = max(self.fpga_rtt - NETWORK_LATENCY_OFFSET, 0.000001)
+        
+        print(f"FPGA Round Trip Time (RTT)   : {self.fpga_rtt:.6f} sec")
+        print(f"FPGA Est. Time (w/o network) : {hw_time_adjusted:.6f} sec")
+        print(f"CPU Time                     : {self.software_time:.6f} sec")
+        
+        print(f"\nCPU Active Operational Clock : {MANUAL_CPU_FREQ_MHZ:.2f} MHz")
+        print(f"FPGA Reference Design Clock  : {FPGA_CLOCK_MHZ:.2f} MHz")
+
+        # Temporal domain converted to absolute core clock cycle counts
+        cpu_cycles = self.software_time * (MANUAL_CPU_FREQ_MHZ * 1e6)
+        fpga_cycles = hw_time_adjusted * (FPGA_CLOCK_MHZ * 1e6)
+        
+        print(f"\nCalculated Active CPU Cycles : {int(cpu_cycles):,}")
+        print(f"Calculated Running FPGA Cycles: {int(fpga_cycles):,}")
+        
+        speedup_absolute = self.software_time / hw_time_adjusted
+        speedup_scaled = cpu_cycles / fpga_cycles
+
+        print(f"\nAbsolute Speedup (Time-domain)     : {speedup_absolute:.2f}x")
+        print(f"Architectural Speedup (Cycle-scale): {speedup_scaled:.2f}x")
+
+    def compare_and_exit(self):
+        print("\n--- FUNCTIONAL COMPARISON RESULTS ---")
+        print(f"Expected (Hex) : {self.expected_bytes.hex().upper()}")
+        print(f"Received (Hex) : {self.received_logits_bytes.hex().upper()}")
+
+        if self.received_logits_bytes == self.expected_bytes:
+            print("\n✅ SUCCESS! The FPGA outputs match the testbench perfectly.")
+        else:
+            print("\n❌ MISMATCH DETECTED!")
+        
+        self.compare_performance()
+        
+        # Explicitly clean up Layer 2 socket binding to decrease teardown warning noise
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+            
+        self.running = False
+
+    def wait(self):
+        timeout_timer = 5
+        while self.running and timeout_timer > 0:
+            time.sleep(1)
+            timeout_timer -= 1
+        
+        if timeout_timer == 0 and self.running:
+            print("\n[!] TIMEOUT: Did not receive a response from the FPGA in time.")
+            self.running = False
+
+
+if __name__ == "__main__":
+    tester = CnnEthernetTester()
+    tester.send_input_image()
+    tester.wait()
+\end{lstlisting}
+
+\subsection{spi.py}
+\begin{lstlisting}[language=Python]
+import spidev
+import time
+import numpy as np
+from PIL import Image
+from gpiozero import Button, DigitalOutputDevice
+
+class FPGACNN:
+    # Running at the verified 8 MHz with Dummy CS on GPIO 16
+    def __init__(self, bus=0, device=0, speed_hz=8000000, interrupt_pin=25, cs_pin=16):
+        self.speed_hz = speed_hz
+        self.spi = spidev.SpiDev()
+        self.spi.open(bus, device)
+        self.spi.max_speed_hz = self.speed_hz
+        self.spi.mode = 0
+        
+        # --- THE DUMMY CS FIX ---
+        self.cs_n = DigitalOutputDevice(cs_pin, initial_value=True)
+        self.data_ready = Button(interrupt_pin, pull_up=False)
+
+    def preprocess_image(self, image_path):
+        """Loads image, zero-pads to 34x34, and converts to Q8.8 byte payload."""
+        img = Image.open(image_path).convert('L').resize((32, 32))
+        pixel_data = np.array(img, dtype=np.float32)
+        
+        padded_img = np.pad(pixel_data, pad_width=1, mode='constant', constant_values=0)
+        padded_img = (padded_img / 255.0) * 256.0
+        fixed_point_pixels = np.round(padded_img).astype(np.int16).flatten().tolist()
+        
+        spi_payload = []
+        for pixel in fixed_point_pixels:
+            spi_payload.extend([(pixel >> 8) & 0xFF, pixel & 0xFF])
+            
+        return spi_payload
+
+    def run_inference(self, image_path):
+        payload = self.preprocess_image(image_path)
+        
+        try:
+            self.cs_n.off() # Start Transaction
+            
+            # --- LAP 1: SPI Transmit ---
+            t0 = time.perf_counter()
+            self.spi.xfer2(payload)
+            
+            # --- LAP 2: FPGA Compute ---
+            t1 = time.perf_counter() 
+            if self.data_ready.wait_for_active(timeout=2.0):
+                
+                # --- LAP 3: SPI Receive ---
+                t2 = time.perf_counter()
+                rx_data = self.spi.xfer2([0x00] * 6) 
+                t3 = time.perf_counter()
+                
+                # Calculate the exact millisecond breakdown
+                timing = {
+                    "spi_tx_ms": (t1 - t0) * 1000.0,
+                    "fpga_compute_ms": (t2 - t1) * 1000.0,
+                    "spi_rx_ms": (t3 - t2) * 1000.0,
+                    "total_system_ms": (t3 - t0) * 1000.0
+                }
+                
+                # Reconstruct 16-bit Signed Q8.8 Logits
+                logits = []
+                for i in range(0, 6, 2):
+                    val = (rx_data[i] << 8) | rx_data[i+1]
+                    if val > 32767:
+                        val -= 65536 
+                    logits.append(val)
+                    
+                return logits, timing
+            else:
+                print(f"Timeout waiting for DATA_READY on {image_path}")
+                return None, None
+                
+        finally:
+            self.cs_n.on() # End Transaction safely
+
+    def close(self):
+        self.spi.close()
+\end{lstlisting}
+
+\subsection{benchmark.py}
+\begin{lstlisting}[language=Python]
+import glob
+import numpy as np
+import time
+import random
+from PIL import Image
+from gpiozero import Button, DigitalOutputDevice
+
+# Import Custom Hardware & SW Reference
+from spi import FPGACNN
+from golden_model import run_full_inference
+
+# Import LiteRT (TensorFlow Lite)
+try:
+    from ai_edge_litert.interpreter import Interpreter
+except ImportError:
+    print("Error: LiteRT not found. Please install tflite_runtime or ai_edge_litert.")
+    exit()
+
+# --- THE LOOPBACK CALIBRATION SETUP ---
+# Wire GPIO 17 (Physical Pin 11) directly to GPIO 27 (Physical Pin 13)!
+fake_fpga_out = DigitalOutputDevice(17, initial_value=False)
+os_listener = Button(27, pull_up=False)
+
+def measure_os_overhead():
+    """Forces the Pi to interrupt itself to measure the current OS latency."""
+    fake_fpga_out.off()
+    time.sleep(0.01) # Let the line settle
+    
+    t_start = time.perf_counter()
+    fake_fpga_out.on() # Trigger the interrupt!
+    os_listener.wait_for_active(timeout=1.0)
+    t_end = time.perf_counter()
+    
+    fake_fpga_out.off()
+    return (t_end - t_start) * 1000.0 # Return overhead in ms
+
+def prep_tflite_image(image_path):
+    """Prepares the image exactly how TFLite expects it: (1, 32, 32, 1) Float32"""
+    img = Image.open(image_path).convert('L').resize((32, 32))
+    img_array = np.array(img, dtype=np.float32)
+    return np.expand_dims(img_array, axis=(0, -1))
+
+def main():
+    print("======================================================")
+    print("  HARDWARE vs SOFTWARE PERFORMANCE BENCHMARK SUITE  ")
+    print("======================================================")
+    
+    # 1. Initialize Hardware Engine
+    fpga_engine = FPGACNN(speed_hz=8000000, interrupt_pin=25, cs_pin=16)
+    
+    # 2. Initialize TFLite Software Engine
+    interpreter = Interpreter(model_path="tiny_ai_brain.tflite")
+    interpreter.allocate_tensors()
+    in_idx = interpreter.get_input_details()[0]['index']
+    out_idx = interpreter.get_output_details()[0]['index']
+    
+    # --- WARM UP THE CPU ---
+    print("Warming up the CPU cache...")
+    dummy_input = np.zeros((1, 32, 32, 1), dtype=np.float32)
+    interpreter.set_tensor(in_idx, dummy_input)
+    interpreter.invoke()
+    
+    # 3. Find and Randomize Test Images
+    test_images = glob.glob("Doglets/*/*.jpg")
+    if not test_images:
+        print("Error: Could not find test images in 'Doglets/*/*.jpg'")
+        return
+        
+    random.shuffle(test_images) # THE FIX: Randomize the testing order!
+    
+    matches = 0
+    total_images = min(10, len(test_images)) 
+    classes = ["Cat", "Dog", "Human"]
+    
+    for img_path in test_images[:total_images]: 
+        print(f"\nEvaluating: {img_path}")
+        
+        # ----------------------------------------------------
+        # TEST A: THE SOFTWARE BENCHMARK (TFLite)
+        # ----------------------------------------------------
+        sw_input = prep_tflite_image(img_path)
+        t0_sw = time.perf_counter()
+        interpreter.set_tensor(in_idx, sw_input)
+        interpreter.invoke()
+        sw_raw = interpreter.get_tensor(out_idx)[0]
+        sw_time_ms = (time.perf_counter() - t0_sw) * 1000.0
+        sw_pred = classes[np.argmax(sw_raw)]
+        
+        # ----------------------------------------------------
+        # DYNAMIC OS CALIBRATION
+        # ----------------------------------------------------
+        current_os_overhead = measure_os_overhead()
+        
+        # ----------------------------------------------------
+        # TEST B: THE HARDWARE BENCHMARK (FPGA)
+        # ----------------------------------------------------
+        fpga_logits, hw_timing = fpga_engine.run_inference(img_path)
+        if fpga_logits is None:
+            continue
+        fpga_pred = classes[np.argmax(fpga_logits)]
+        
+        # ----------------------------------------------------
+        # TEST C: THE ACCURACY BENCHMARK (Golden Model)
+        # ----------------------------------------------------
+        golden_logits = run_full_inference(img_path)
+        is_exact = "YES" if fpga_logits == golden_logits else "NO"
+        if is_exact == "YES":
+            matches += 1
+
+        # ----------------------------------------------------
+        # CALCULATE TRUE FPGA MATH TIME
+        # ----------------------------------------------------
+        raw_measured = hw_timing['fpga_compute_ms']
+        true_fpga_math = raw_measured - current_os_overhead
+        
+        # Prevent "negative time" caused by Linux Scheduler Jitter
+        if true_fpga_math < 0.001:
+            true_fpga_math = 0.001 
+
+        # ----------------------------------------------------
+        # PRINT THE RESULTS TABLE
+        # ----------------------------------------------------
+        print(f"| Metric                   | Pi 5 SW (TFLite) | FPGA HW (Artix-7) |")
+        print(f"|--------------------------|------------------|-------------------|")
+        print(f"| Prediction               | {sw_pred:<16} | {fpga_pred:<17} |")
+        print(f"| 100% Bit-Exact Parity?   | N/A              | {is_exact:<17} |")
+        print(f"| Compute Time (Pure Math) | {sw_time_ms:>13.3f} ms | {true_fpga_math:>14.3f} ms |")
+        print(f"| SPI Transfer Time (I/O)  | N/A              | {hw_timing['spi_tx_ms'] + hw_timing['spi_rx_ms']:>14.3f} ms |")
+        print(f"| Linux OS Overhead Delay  | N/A              | {current_os_overhead:>14.3f} ms |") 
+        print(f"| Total System Latency     | {sw_time_ms:>13.3f} ms | {hw_timing['total_system_ms']:>14.3f} ms |")
+        print(f"|--------------------------|------------------|-------------------|")
+        
+    print("\n======================================================")
+    print(f" BENCHMARK COMPLETE ")
+    print(f" Verified Math Parity: {matches}/{total_images} ({(matches/total_images)*100}%)")
+    print("======================================================")
+    
+    fpga_engine.close()
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\subsection{generate_testbench_data.py}
+\begin{lstlisting}[language=Python]
+import os
+import numpy as np
+from golden_model import (
+    run_full_inference, dsp48_mac, conv2d_valid, 
+    padder2d, max_pool2d_2x2, flatten3d, dense_layer, load_q88_weights
+)
+from PIL import Image
+
+# ─────────────────────────────────────────────
+#  Phase 1.4: Testbench Data Generator
+# ─────────────────────────────────────────────
+
+OUTPUT_DIR = "testbench_data"
+
+def to_hex_16bit(val):
+    """Converts a Q8.8 integer to a 4-char hex string."""
+    return f"{int(val) & 0xFFFF:04X}"
+
+def save_map_to_hex(filename, data_map):
+    """Flattens a 3D or 1D map and saves as a .hex file for VHDL $readmemh."""
+    # Flatten if it's a 3D map (H, W, C)
+    if isinstance(data_map[0], list) and isinstance(data_map[0][0], list):
+        flat_list = []
+        for y in range(len(data_map)):
+            for x in range(len(data_map[0])):
+                for c in range(len(data_map[0][0])):
+                    flat_list.append(data_map[y][x][c])
+    else:
+        flat_list = data_map # Already 1D (like logits or flattened layer)
+
+    with open(os.path.join(OUTPUT_DIR, filename), 'w') as f:
+        for val in flat_list:
+            f.write(to_hex_16bit(val) + "\n")
+
+def generate_full_trace(img_path, label):
+    print(f"\nTracing layers for: {label} ({img_path})")
+    
+    # 1. Pre-process Image (Master Plan Sec 7.3)
+    img = Image.open(img_path).convert('L').resize((32, 32))
+    pixel_data = np.array(img, dtype=int)
+    padded_img = np.pad(pixel_data, pad_width=1, mode='constant', constant_values=0)
+    hw_map = [[[int(padded_img[y][x])] for x in range(34)] for y in range(34)]
+    
+    # Save input image hex (34x34 = 1156 words)
+    save_map_to_hex(f"{label}_0_input.hex", hw_map)
+
+    # 2. Load Weights
+    c1_w, c1_b = load_q88_weights("conv1")
+    c2_w, c2_b = load_q88_weights("conv2")
+    c3_w, c3_b = load_q88_weights("conv3")
+    d1_w, d1_b = load_q88_weights("dense1")
+    d2_w, d2_b = load_q88_weights("dense2")
+
+    # 3. Run and Save Every Layer Step
+    print("  Processing Conv1...")
+    x = conv2d_valid(hw_map, c1_w, c1_b, apply_relu=True)
+    save_map_to_hex(f"{label}_1_conv1.hex", x)
+    
+    print("  Processing Pool1...")
+    x = max_pool2d_2x2(x)
+    save_map_to_hex(f"{label}_2_pool1.hex", x)
+    
+    print("  Processing Pad1...")
+    x = padder2d(x)
+    save_map_to_hex(f"{label}_3_pad1.hex", x)
+    
+    print("  Processing Conv2...")
+    x = conv2d_valid(x, c2_w, c2_b, apply_relu=True)
+    save_map_to_hex(f"{label}_4_conv2.hex", x)
+    
+    print("  Processing Pool2...")
+    x = max_pool2d_2x2(x)
+    save_map_to_hex(f"{label}_5_pool2.hex", x)
+    
+    print("  Processing Pad2...")
+    x = padder2d(x)
+    save_map_to_hex(f"{label}_6_pad2.hex", x)
+    
+    print("  Processing Conv3...")
+    x = conv2d_valid(x, c3_w, c3_b, apply_relu=True)
+    save_map_to_hex(f"{label}_7_conv3.hex", x)
+    
+    print("  Processing Pool3...")
+    x = max_pool2d_2x2(x)
+    save_map_to_hex(f"{label}_8_pool3.hex", x)
+    
+    print("  Processing Flatten...")
+    x = flatten3d(x)
+    save_map_to_hex(f"{label}_9_flatten.hex", x)
+    
+    print("  Processing Dense1...")
+    # UPDATED: Added out_c=32
+    x = dense_layer(x, d1_w, d1_b, out_c=32, apply_relu=True)
+    save_map_to_hex(f"{label}_10_dense1.hex", x)
+    
+    print("  Processing Dense2...")
+    # UPDATED: Added out_c=3
+    logits = dense_layer(x, d2_w, d2_b, out_c=3, apply_relu=False)
+    save_map_to_hex(f"{label}_11_logits.hex", logits)
+    
+    print(f"Done. Files saved to {OUTPUT_DIR}/")
+
+if __name__ == "__main__":
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    # We use 3 images for the answer key (one per class)
+    test_images = {
+        "cat": "Doglets/Cat/0.jpg",
+        "dog": "Doglets/Dog/0.jpg",
+        "human": "Doglets/Human/image_025556.png" # Update with a real path from your Human folder
+    }
+
+    for label, path in test_images.items():
+        if os.path.exists(path):
+            generate_full_trace(path, label)
+        else:
+            print(f"Warning: Could not find {path}, skipping {label} trace.")
+\end{lstlisting}
+
+\subsection{convert_h5_to_tflite.py}
+\begin{lstlisting}[language=Python]
+import tensorflow as tf
+import sys
+import os
+
+def convert_h5_to_tflite(h5_path):
+    if not os.path.exists(h5_path):
+        print(f"Error: {h5_path} does not exist.")
+        return
+
+    # Create tflite path in the same directory with same base name
+    base_name = os.path.splitext(h5_path)[0]
+    tflite_path = base_name + ".tflite"
+
+    try:
+        print(f"Loading model from {h5_path}...")
+        model = tf.keras.models.load_model(h5_path)
+        
+        print("Converting model to TFLite...")
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        
+        # Uncomment the following line if you want to apply post-training quantization
+        # converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        
+        tflite_model = converter.convert()
+        
+        print(f"Saving TFLite model to {tflite_path}...")
+        with open(tflite_path, 'wb') as f:
+            f.write(tflite_model)
+            
+        print("Conversion completed successfully!")
+        
+    except Exception as e:
+        print(f"An error occurred during conversion: {e}")
+
+if __name__ == "__main__":
+    # Use the specific .h5 file found in the directory by default
+    # Change this if you have a different filename
+    default_h5 = "tiny_ai_brain.h5"
+    
+    # Allow passing filename as argument, e.g., `python convert_h5_to_tflite.py my_model.h5`
+    if len(sys.argv) > 1:
+        h5_file = sys.argv[1]
+    else:
+        h5_file = default_h5
+        
+    convert_h5_to_tflite(h5_file)
+
+\end{lstlisting}

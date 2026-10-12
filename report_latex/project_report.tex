@@ -1,0 +1,148 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{caption}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+
+\lstset{style=mystyle}
+
+\title{
+    \vspace{-2cm}
+    \begin{center}
+        \Large \textbf{German University in Cairo (GUC)} \\
+        \large Digital System Design - 6th Semester \\
+    \end{center}
+    \vspace{2cm}
+    \textbf{FPGA-Accelerated CNN Inference Engine} \\
+    \large A Custom VHDL Neural Network Accelerator on Artix-7
+}
+\author{
+    \textbf{Team: 7 Segment Displays} \\[0.5cm]
+    \normalsize
+    \begin{tabular}{c}
+        Muhammad Walid 61-34156 T4 \\
+        Morkos Shenouda [ID] [TUT] \\
+        Youssef Tarek [ID] [TUT] \\
+        Ziad Saad [ID] [TUT] \\
+        Amr Ahmed [ID] [TUT] \\
+        David Hany [ID] [TUT] \\
+        Ziad Ahmed [ID] [TUT]
+    \end{tabular}
+}
+\date{\vspace{1cm}
+    \textbf{Professor:} Dr. Mohamed Abdel Ghany Ahmed Salem \\
+    \textbf{TA:} Eng. Mohamed Ahmed Awaad Ibrahim \\
+    \today
+}
+
+\begin{document}
+
+\maketitle
+\newpage
+\tableofsections
+\tableofcontents
+\newpage
+
+\section{Abstract}
+This project presents the design, implementation, and verification of a custom FPGA-accelerated Convolutional Neural Network (CNN) inference engine. The system is capable of classifying 32x32 grayscale images into three categories (Cat, Dog, Human) using a fully custom VHDL datapath. It avoids High-Level Synthesis (HLS) and vendor IP cores for the CNN logic, achieving near cycle-parity (0.90x) with a 5.2 GHz Intel i7-14700HX processor while operating at a 52x lower clock frequency (100 MHz) and consuming only 0.269W. The project evolved in two phases: Phase 1 utilized an SPI interface for communication with a Raspberry Pi, and Phase 2 upgraded to a 100 Mbps Ethernet (RMII) interface to eliminate I/O bottlenecks and enable rigorous desktop benchmarking.
+
+\section{Introduction}
+General-purpose CPUs execute sequential instructions, limiting their efficiency in parallel workloads like CNN inference. This project aims to exploit the spatial parallelism of FPGAs to accelerate a 5-layer CNN model. 
+
+The custom datapath leverages the Artix-7 FPGA's DSP48E1 slices and Block RAMs to perform concurrent Multiply-Accumulate (MAC) operations. By adopting a Q8.8 16-bit fixed-point arithmetic format, the design maintains bit-exact parity with a software Golden Model.
+
+\section{System Architecture}
+
+\subsection{CNN Model Overview}
+The CNN was trained in Python using TensorFlow/Keras on a custom dataset over 50 epochs. The architecture consists of:
+\begin{itemize}
+    \item Input: 32x32x1 (Padded to 34x34 for hardware)
+    \item Conv1 + ReLU: 3x3, 16 filters
+    \item MaxPool1: 2x2
+    \item Conv2 + ReLU: 3x3, 32 filters
+    \item MaxPool2: 2x2
+    \item Conv3 + ReLU: 3x3, 32 filters
+    \item MaxPool3: 2x2
+    \item Flatten
+    \item Dense1 + ReLU: 512 to 32
+    \item Dense2 (Logits): 32 to 3
+\end{itemize}
+
+\subsection{Hardware Datapath}
+The hardware datapath is composed of 13 custom VHDL modules. 
+The convolution layers utilize line buffers and a sliding window mechanism to feed data into a DSP48E1-based binary adder tree. The Dense layers feature parallel MAC engines to rapidly compute matrix multiplications. Inter-module communication is governed by a robust AXI-Stream-like valid/ready handshake, ensuring backpressure support and data integrity.
+
+\section{Implementation Phases}
+
+\subsection{Phase 1: SPI Communication}
+In the first phase, a Raspberry Pi 5 served as the host, transmitting image pixels and receiving logits via an 8 MHz SPI bus. While functionally correct and significantly faster than the Pi's ARM CPU in pure compute (15x fewer cycles), the system was I/O bound. The SPI transfer accounted for 69\% of the total latency, masking the true performance of the FPGA accelerator.
+
+\subsection{Phase 2: Ethernet Upgrade}
+To overcome the I/O bottleneck, Phase 2 integrated a 100 Mbps RMII Ethernet stack. An open-source RMII MAC was paired with a custom \texttt{eth\_cnn\_bridge} module, incorporating RX and TX FIFOs. The bridge automatically strips the 42-byte OSI headers (Ethernet + IP + UDP) and streams the 1,156-byte image payload directly into the CNN core. This upgrade provided 12.5x more bandwidth, allowing direct performance comparisons against a high-end desktop CPU.
+
+\section{Verification and Benchmarks}
+
+\subsection{Verification Methodology}
+A Python-based integer-only Golden Model (\texttt{golden\_model.py}) was developed to perfectly emulate the FPGA's Q8.8 fixed-point arithmetic, including DSP48 MAC behavior and ReLU activations. 100 test images were evaluated on both the hardware and the Golden Model, achieving 100\% bit-exact parity.
+
+\subsection{Performance Metrics}
+The Ethernet-enabled FPGA was benchmarked against an Intel i7-14700HX running TensorFlow Lite:
+\begin{itemize}
+    \item \textbf{Intel i7 (5.2 GHz):} 92 $\mu$s latency, 477,880 cycles, ~45W TDP.
+    \item \textbf{Artix-7 (100 MHz):} 5.3 ms latency, 530,759 cycles, 0.269W TDP.
+    \item \textbf{Architectural Efficiency:} The FPGA achieved a 0.90x cycle-parity with the i7, demonstrating that the custom spatial architecture requires only 11\% more cycles than a superscalar x86 processor.
+    \item \textbf{Power Efficiency:} The FPGA is 167x more power-efficient per inference.
+\end{itemize}
+
+\subsection{Resource Utilization}
+\begin{itemize}
+    \item \textbf{LUTs:} 3,919 (6.18\%)
+    \item \textbf{Flip-Flops:} 3,634 (2.87\%)
+    \item \textbf{BRAM:} 15.5 (11.48\%)
+    \item \textbf{DSP48E1:} 46 (19.17\%)
+    \item \textbf{WNS:} +7.042 ns
+\end{itemize}
+
+\section{Conclusion and Future Work}
+The project successfully delivered a fully custom, high-efficiency CNN accelerator. The core logic proved interface-agnostic, seamlessly transitioning from SPI to Ethernet while maintaining bit-exact accuracy. 
+Future work includes migrating the design to a Zynq-7000 SoC to leverage shared AXI memory, eliminating I/O transit overhead completely and potentially eclipsing desktop CPU latency in absolute time.
+
+\newpage
+\appendix
+\section{VHDL Source Code}
+\input{appendix_vhdl.tex}
+
+\section{Python Scripts}
+\input{appendix_python.tex}
+
+\end{document}

@@ -1,0 +1,1984 @@
+
+\subsection{cnn_config.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+package cnn_config is
+    -- Image dimensions
+    constant IMG_W            : integer := 32;
+    constant IMG_H            : integer := 32;
+    constant PADDED_IMG_W     : integer := 34; -- Pi-side padding
+    constant PADDED_IMG_H     : integer := 34;
+    constant IMG_SIZE         : integer := 1156; -- 34*34
+
+    -- Layer output dimensions (after valid conv, before pool)
+    constant CONV1_OUT_W      : integer := 32; -- 34-2
+    constant POOL1_OUT_W      : integer := 16; -- 32/2
+    constant CONV2_IN_W       : integer := 18; -- 16+2 (Padder1)
+    constant CONV2_OUT_W      : integer := 16; -- 18-2
+    constant POOL2_OUT_W      : integer := 8;  -- 16/2
+    constant CONV3_IN_W       : integer := 10; -- 8+2 (Padder2)
+    constant CONV3_OUT_W      : integer := 8;  -- 10-2
+    constant POOL3_OUT_W      : integer := 4;  -- 8/2
+    constant FLATTEN_SIZE     : integer := 512; -- 4*4*32
+
+    -- Channel counts
+    constant CONV1_IN_CH      : integer := 1;
+    constant CONV1_OUT_CH     : integer := 16;
+    constant CONV2_IN_CH      : integer := 16;
+    constant CONV2_OUT_CH     : integer := 32;
+    constant CONV3_IN_CH      : integer := 32;
+    constant CONV3_OUT_CH     : integer := 32;
+    constant DENSE1_IN        : integer := 512;
+    constant DENSE1_OUT       : integer := 32;
+    constant DENSE2_IN        : integer := 32;
+    constant DENSE2_OUT       : integer := 3;
+
+    -- Arithmetic
+    constant DATA_WIDTH       : integer := 16; -- Q8.8
+    constant ACCUM_WIDTH      : integer := 48; -- DSP48 P register
+    constant FRAC_BITS        : integer := 8;  -- fractional bits
+
+    -- SPI
+    constant SPI_DATA_WIDTH   : integer := 16;
+
+    -- Parallelism (set to 2 for recommended configuration)
+    constant CONV_OC_PARALLEL : integer := 2; -- output channels computed in parallel
+    constant DENSE_PARALLEL   : integer := 8; -- MACs in dense engine
+
+    -- Derived: number of classes
+    constant NUM_CLASSES      : integer := 3;
+end package cnn_config;
+\end{lstlisting}
+
+\subsection{system_top.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.cnn_config.all;
+
+entity system_top is
+    port (
+        clk_100mhz : in  std_logic;
+        reset_n    : in  std_logic; 
+        
+        -- SPI Interface
+        spi_cs_n   : in  std_logic;
+        spi_sclk   : in  std_logic;
+        spi_mosi   : in  std_logic;
+        spi_miso   : out std_logic;
+        
+        -- Hardware Interrupt
+        data_ready : out std_logic;
+        
+        -- NEW: Hardware Debugger LEDs
+        led        : out std_logic_vector(15 downto 0)
+    );
+end entity;
+
+architecture struct of system_top is
+
+    signal sys_reset      : std_logic;
+    signal soft_reset     : std_logic;
+    signal combined_reset : std_logic;
+
+    -- SPI Controller Signals
+    signal spi_rx_data    : std_logic_vector(15 downto 0);
+    signal spi_rx_valid   : std_logic;
+    signal spi_tx_data    : std_logic_vector(15 downto 0);
+    signal spi_tx_load    : std_logic;
+
+    -- Synchronization (The Metastability Fix)
+    signal sclk_sync      : std_logic_vector(2 downto 0) := "000";
+    signal cs_sync        : std_logic_vector(1 downto 0) := "11";
+
+    -- FIFO and CNN Signals
+    signal rx_fifo_wr_en, rx_fifo_rd_en, rx_fifo_empty, rx_fifo_full : std_logic;
+    signal rx_fifo_data   : std_logic_vector(15 downto 0);
+    signal tx_fifo_wr_en, tx_fifo_rd_en, tx_fifo_empty, tx_fifo_full : std_logic;
+    signal tx_fifo_data   : std_logic_vector(15 downto 0);
+    signal cnn_in_valid, cnn_in_ready, cnn_out_valid, cnn_out_ready : std_logic;
+    signal cnn_out_data   : std_logic_vector(15 downto 0);
+
+    -- FSM Definition
+    type system_state_type is (IDLE, CAPTURE_AND_INFERENCE, PRE_LOAD, SEND_RESULTS, WAIT_FOR_SAFE_LOAD);
+    signal state : system_state_type := IDLE;
+
+    signal pixel_count : integer range 0 to 2047 := 0;
+    signal logit_count : integer range 0 to 15 := 0;
+    signal read_count  : integer range 0 to 15 := 0;
+
+begin
+
+    sys_reset <= not reset_n;
+    combined_reset <= sys_reset or soft_reset;
+
+    -- Synchronizers for Top-Level FSM (fixes metastability!)
+    process(clk_100mhz)
+    begin
+        if rising_edge(clk_100mhz) then
+            sclk_sync <= sclk_sync(1 downto 0) & spi_sclk;
+            cs_sync   <= cs_sync(0) & spi_cs_n;
+        end if;
+    end process;
+
+    u_spi_ctrl: entity work.spi_controller
+        generic map(G_TX_WIDTH => 16, G_RX_WIDTH => 16)
+        port map(
+            clk_100mhz => clk_100mhz, reset => sys_reset,
+            spi_cs_n => spi_cs_n, spi_sclk => spi_sclk, spi_mosi => spi_mosi, spi_miso => spi_miso,
+            tx_data => spi_tx_data, tx_load => spi_tx_load, rx_data => spi_rx_data, rx_valid => spi_rx_valid
+        );
+
+    u_rx_fifo: entity work.sync_fifo
+        generic map(DATA_WIDTH => 16, ADDR_WIDTH => 11)
+        port map(clk => clk_100mhz, reset => combined_reset, wr_en => rx_fifo_wr_en, wr_data => spi_rx_data, rd_en => rx_fifo_rd_en, rd_data => rx_fifo_data, empty => rx_fifo_empty, full => rx_fifo_full);
+
+    u_cnn_core: entity work.cnn_datapath_top
+        port map(clk => clk_100mhz, reset => combined_reset, in_data => rx_fifo_data, in_valid => cnn_in_valid, in_ready => cnn_in_ready, out_data => cnn_out_data, out_valid => cnn_out_valid, out_ready => cnn_out_ready);
+
+    u_tx_fifo: entity work.sync_fifo
+        generic map(DATA_WIDTH => 16, ADDR_WIDTH => 4)
+        port map(clk => clk_100mhz, reset => combined_reset, wr_en => tx_fifo_wr_en, wr_data => cnn_out_data, rd_en => tx_fifo_rd_en, rd_data => tx_fifo_data, empty => tx_fifo_empty, full => tx_fifo_full);
+
+    -- Routing
+    rx_fifo_wr_en <= spi_rx_valid when state = CAPTURE_AND_INFERENCE else '0';
+    cnn_in_valid  <= not rx_fifo_empty;
+    rx_fifo_rd_en <= cnn_in_ready and not rx_fifo_empty;
+    tx_fifo_wr_en <= cnn_out_valid;
+    cnn_out_ready <= not tx_fifo_full; 
+    spi_tx_data   <= tx_fifo_data;
+
+    -- Master FSM
+    process(clk_100mhz)
+    begin
+        if rising_edge(clk_100mhz) then
+            if sys_reset = '1' then
+                state <= IDLE;
+                data_ready <= '0';
+                soft_reset <= '1';
+                spi_tx_load <= '0';
+                tx_fifo_rd_en <= '0';
+                pixel_count <= 0;
+                logit_count <= 0;
+                read_count <= 0;
+            else
+                -- Default strobes
+                spi_tx_load <= '0';
+                tx_fifo_rd_en <= '0';
+                soft_reset <= '0';
+
+                case state is
+                    when IDLE =>
+                        data_ready <= '0';
+                        pixel_count <= 0;
+                        logit_count <= 0;
+                        read_count <= 0;
+                        soft_reset <= '1'; -- Hold CNN in reset until Pi starts talking
+                        
+                        -- Start ONLY when synchronized CS goes low
+                        if cs_sync(1) = '0' then
+                            state <= CAPTURE_AND_INFERENCE;
+                            soft_reset <= '0';
+                        end if;
+
+                    when CAPTURE_AND_INFERENCE =>
+                        if spi_rx_valid = '1' then 
+                            pixel_count <= pixel_count + 1;
+                        end if;
+                        
+                        if cnn_out_valid = '1' then
+                            logit_count <= logit_count + 1;
+                            if logit_count = NUM_CLASSES - 1 then 
+                                state <= PRE_LOAD; 
+                            end if;
+                        end if;
+
+                        -- Emergency abort if Pi raises CS_N prematurely
+                        if cs_sync(1) = '1' and logit_count < NUM_CLASSES - 1 then
+                            state <= IDLE;
+                        end if;
+
+                    when PRE_LOAD =>
+                        spi_tx_load   <= '1';
+                        tx_fifo_rd_en <= '1'; 
+                        state <= SEND_RESULTS;
+
+                    when SEND_RESULTS =>
+                        data_ready <= '1';
+                        
+                        if spi_rx_valid = '1' then
+                            read_count <= read_count + 1;
+                            state <= WAIT_FOR_SAFE_LOAD;
+                        end if;
+
+                        -- If Pi raises CS_N, the transaction is over!
+                        if cs_sync(1) = '1' then
+                            state <= IDLE;
+                        end if;
+
+                    when WAIT_FOR_SAFE_LOAD =>
+                        data_ready <= '1'; -- Keep it high so Pi doesn't drop out
+                        if sclk_sync(1) = '0' then
+                            tx_fifo_rd_en <= '1';
+                            spi_tx_load   <= '1'; 
+                            state <= SEND_RESULTS;
+                        end if;
+
+                        if cs_sync(1) = '1' then
+                            state <= IDLE;
+                        end if;
+
+                    when others => 
+                        state <= IDLE;
+                end case;
+            end if;
+        end if;
+    end process;
+
+    -- ==========================================
+    -- HARDWARE LED DEBUGGER
+    -- ==========================================
+    led(15 downto 12) <= "0000" when state = IDLE else
+                         "0001" when state = CAPTURE_AND_INFERENCE else
+                         "0010" when state = PRE_LOAD else
+                         "0011" when state = SEND_RESULTS else
+                         "0100" when state = WAIT_FOR_SAFE_LOAD else 
+                         "1111";
+                         
+    -- LED 11: Flashes if the CNN is stuck waiting for pixels (RX FIFO empty)
+    led(11) <= rx_fifo_empty;
+    
+    -- LEDs 10-0: Binary representation of the Pixel Count
+    led(10 downto 0) <= std_logic_vector(to_unsigned(pixel_count, 11));
+
+end architecture;
+\end{lstlisting}
+
+\subsection{cnn_datapath_top.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.cnn_config.all;
+
+entity cnn_datapath_top is
+    generic (
+        -- Global Dimensions
+        G_IMG_W         : integer := 34;
+        G_IMG_H         : integer := 34;
+
+        -- Path prefix relative to the Vivado synth_1 run directory:
+        -- ../../ goes from <project>.runs/synth_1 to the project root.
+        
+        -- Stage 1: Conv1 (34x34 -> 32x32)
+        C1_W_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/conv1_weights.mem";
+        C1_B_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/conv1_biases.mem";
+        C1_OUT_CH       : integer := 16;
+
+        -- Stage 2: Conv2 (18x18 -> 16x16)
+        C2_W_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/conv2_weights.mem";
+        C2_B_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/conv2_biases.mem";
+        C2_OUT_CH       : integer := 32;
+
+        -- Stage 3: Conv3 (10x10 -> 8x8)
+        C3_W_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/conv3_weights.mem";
+        C3_B_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/conv3_biases.mem";
+        C3_OUT_CH       : integer := 32;
+
+        -- Stage 4: Dense1 (512 -> 32)
+        D1_W_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/dense1_weights.mem";
+        D1_B_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/dense1_biases.mem";
+        D1_IN_SIZE      : integer := 512;
+        D1_OUT_SIZE     : integer := 32;
+
+        -- Stage 5: Dense2 (32 -> 8)
+        D2_W_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/dense2_weights.mem";
+        D2_B_FILE       : string  := "../../FPGA_Accelerated_CNN_Inference.srcs/sources_1/imports/export_q88/dense2_biases.mem";
+        D2_IN_SIZE      : integer := 32;
+        D2_OUT_SIZE     : integer := 8
+    );
+    port (
+        clk       : in  std_logic;
+        reset     : in  std_logic;
+        
+        -- AXI-Stream Input
+        in_data   : in  std_logic_vector(15 downto 0);
+        in_valid  : in  std_logic;
+        in_ready  : out std_logic;
+        
+        -- AXI-Stream Output
+        out_data  : out std_logic_vector(15 downto 0);
+        out_valid : out std_logic;
+        out_ready : in  std_logic
+    );
+end entity;
+
+architecture struct of cnn_datapath_top is
+
+    -- Interconnect signals (Data, Valid, Ready)
+    signal s1_data, s2_data, s3_data, s4_data, s5_data   : std_logic_vector(15 downto 0);
+    signal s1_valid, s2_valid, s3_valid, s4_valid, s5_valid : std_logic;
+    signal s1_ready, s2_ready, s3_ready, s4_ready, s5_ready : std_logic;
+
+    signal s6_data, s7_data, s8_data, s9_data, s10_data  : std_logic_vector(15 downto 0);
+    signal s6_valid, s7_valid, s8_valid, s9_valid, s10_valid : std_logic;
+    signal s6_ready, s7_ready, s8_ready, s9_ready, s10_ready : std_logic;
+
+    signal flatten_done_open : std_logic;
+
+begin
+
+    -- =========================================================
+    -- STAGE 1: Feature Extraction
+    -- =========================================================
+    u_conv1: entity work.conv_layer
+        generic map(
+            NUM_IN_CH   => 1,
+            NUM_OUT_CH  => C1_OUT_CH,
+            IMG_W       => G_IMG_W,
+            IMG_H       => G_IMG_H,
+            OC_PARALLEL => 1,
+            WEIGHT_FILE => C1_W_FILE,
+            BIAS_FILE   => C1_B_FILE
+        )
+        port map(
+            clk => clk, reset => reset,
+            in_data => in_data, in_valid => in_valid, in_ready => in_ready,
+            out_data => s1_data, out_valid => s1_valid, out_ready => s1_ready
+        );
+
+    u_pool1: entity work.pool_layer
+        generic map(IMG_W => G_IMG_W-2, IMG_H => G_IMG_H-2, CHANNELS => C1_OUT_CH)
+        port map(clk => clk, reset => reset, in_data => s1_data, in_valid => s1_valid, in_ready => s1_ready, out_data => s2_data, out_valid => s2_valid, out_ready => s2_ready);
+
+    u_pad1: entity work.padder
+        generic map(IMG_W => (G_IMG_W-2)/2, IMG_H => (G_IMG_H-2)/2, CHANNELS => C1_OUT_CH)
+        port map(clk => clk, reset => reset, in_data => s2_data, in_valid => s2_valid, in_ready => s2_ready, out_data => s3_data, out_valid => s3_valid, out_ready => s3_ready);
+
+    -- =========================================================
+    -- STAGE 2: Mid-Level Features
+    -- =========================================================
+    u_conv2: entity work.conv_layer
+        generic map(
+            NUM_IN_CH   => C1_OUT_CH,
+            NUM_OUT_CH  => C2_OUT_CH,
+            IMG_W       => ((G_IMG_W-2)/2)+2,
+            IMG_H       => ((G_IMG_H-2)/2)+2,
+            OC_PARALLEL => 1,
+            WEIGHT_FILE => C2_W_FILE,
+            BIAS_FILE   => C2_B_FILE
+        )
+        port map(
+            clk => clk, reset => reset,
+            in_data => s3_data, in_valid => s3_valid, in_ready => s3_ready,
+            out_data => s4_data, out_valid => s4_valid, out_ready => s4_ready
+        );
+
+    u_pool2: entity work.pool_layer
+        generic map(IMG_W => (G_IMG_W-2)/2, IMG_H => (G_IMG_H-2)/2, CHANNELS => C2_OUT_CH)
+        port map(clk => clk, reset => reset, in_data => s4_data, in_valid => s4_valid, in_ready => s4_ready, out_data => s5_data, out_valid => s5_valid, out_ready => s5_ready);
+
+    u_pad2: entity work.padder
+        generic map(IMG_W => (G_IMG_W-2)/4, IMG_H => (G_IMG_H-2)/4, CHANNELS => C2_OUT_CH)
+        port map(clk => clk, reset => reset, in_data => s5_data, in_valid => s5_valid, in_ready => s5_ready, out_data => s6_data, out_valid => s6_valid, out_ready => s6_ready);
+
+    -- =========================================================
+    -- STAGE 3: High-Level Features
+    -- =========================================================
+    u_conv3: entity work.conv_layer
+        generic map(
+            NUM_IN_CH   => C2_OUT_CH,
+            NUM_OUT_CH  => C3_OUT_CH,
+            IMG_W       => ((G_IMG_W-2)/4)+2,
+            IMG_H       => ((G_IMG_H-2)/4)+2,
+            OC_PARALLEL => 1,
+            WEIGHT_FILE => C3_W_FILE,
+            BIAS_FILE   => C3_B_FILE
+        )
+        port map(
+            clk => clk, reset => reset,
+            in_data => s6_data, in_valid => s6_valid, in_ready => s6_ready,
+            out_data => s7_data, out_valid => s7_valid, out_ready => s7_ready
+        );
+
+    u_pool3: entity work.pool_layer
+        generic map(IMG_W => (G_IMG_W-2)/4, IMG_H => (G_IMG_H-2)/4, CHANNELS => C3_OUT_CH)
+        port map(clk => clk, reset => reset, in_data => s7_data, in_valid => s7_valid, in_ready => s7_ready, out_data => s8_data, out_valid => s8_valid, out_ready => s8_ready);
+
+    -- =========================================================
+    -- BRIDGE & CLASSIFIER
+    -- =========================================================
+    u_flatten: entity work.flatten
+        port map(clk => clk, reset => reset, in_data => s8_data, in_valid => s8_valid, in_ready => s8_ready, out_data => s9_data, out_valid => s9_valid, out_ready => s9_ready, flatten_done => flatten_done_open);
+
+    u_dense1: entity work.dense_engine
+        generic map(
+            IN_SIZE       => D1_IN_SIZE,
+            OUT_SIZE      => D1_OUT_SIZE,
+            PARALLEL_MACS => 8,
+            APPLY_RELU    => true,
+            BIAS_FILE     => D1_B_FILE,
+            WEIGHT_FILE   => D1_W_FILE
+        )
+        port map(
+            clk => clk, reset => reset,
+            in_data => s9_data, in_valid => s9_valid, in_ready => s9_ready,
+            out_data => s10_data, out_valid => s10_valid, out_ready => s10_ready
+        );
+
+    u_dense2: entity work.dense_engine
+        generic map(
+            IN_SIZE       => D2_IN_SIZE,
+            OUT_SIZE      => D2_OUT_SIZE,
+            PARALLEL_MACS => 8,
+            APPLY_RELU    => false,
+            BIAS_FILE     => D2_B_FILE,
+            WEIGHT_FILE   => D2_W_FILE
+        )
+        port map(
+            clk => clk, reset => reset,
+            in_data => s10_data, in_valid => s10_valid, in_ready => s10_ready,
+            out_data => out_data, out_valid => out_valid, out_ready => out_ready
+        );
+
+end architecture;
+\end{lstlisting}
+
+\subsection{conv_layer.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.cnn_config.all;
+
+entity conv_layer is
+    generic (
+        NUM_IN_CH   : integer := 1; 
+        NUM_OUT_CH  : integer := 16;
+        IMG_W       : integer := 34;
+        IMG_H       : integer := 34;
+        OC_PARALLEL : integer := 1;
+        WEIGHT_FILE : string  := "conv1_weights.mem";
+        BIAS_FILE   : string  := "conv1_biases.mem"
+    );
+    port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        
+        in_data     : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        in_valid    : in  std_logic;
+        in_ready    : out std_logic;
+        
+        out_data    : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        out_valid   : out std_logic;
+        out_ready   : in  std_logic
+    );
+end entity;
+
+architecture rtl of conv_layer is
+    type state_t is (SHIFT_IN, CALC_MAC, PRE_STREAM, STREAM_OUT);
+    signal state : state_t := SHIFT_IN;
+
+    signal col_cnt : integer range 0 to IMG_W - 1 := 0;
+    signal row_cnt : integer range 0 to IMG_H - 1 := 0;
+    signal ic_cnt  : integer range 0 to NUM_IN_CH - 1 := 0;
+
+    constant BUF_DEPTH : integer := IMG_W * NUM_IN_CH;
+    type ram_type is array (0 to BUF_DEPTH - 1) of signed(DATA_WIDTH-1 downto 0);
+    signal line_buf_1 : ram_type := (others => (others => '0'));
+    signal line_buf_2 : ram_type := (others => (others => '0'));
+    signal rd_addr    : integer range 0 to BUF_DEPTH - 1 := 0;
+
+    constant DELAY_LEN : integer := 2 * NUM_IN_CH;
+    type delay_line_t is array (0 to DELAY_LEN) of signed(DATA_WIDTH-1 downto 0);
+    signal delay_row0 : delay_line_t := (others => (others => '0'));
+    signal delay_row1 : delay_line_t := (others => (others => '0'));
+    signal delay_row2 : delay_line_t := (others => (others => '0'));
+
+    signal rom_addr : std_logic_vector(31 downto 0) := (others => '0');
+    signal rom_dout : std_logic_vector(143 downto 0);
+    type weight_array_t is array (0 to 8) of signed(15 downto 0);
+    signal real_weights : weight_array_t := (others => (others => '0'));
+    
+    signal bias_addr : std_logic_vector(31 downto 0) := (others => '0');
+    signal bias_dout : std_logic_vector(15 downto 0);
+    
+    -- NEW: Extended pipeline registers for the Binary Adder Tree
+    signal bias_reg_1  : signed(15 downto 0) := (others => '0');
+    signal bias_reg_2  : signed(15 downto 0) := (others => '0');
+    signal bias_reg_3  : signed(15 downto 0) := (others => '0');
+    
+    signal sum_A       : signed(47 downto 0) := (others => '0');
+    signal sum_B       : signed(47 downto 0) := (others => '0');
+    signal sum_C       : signed(47 downto 0) := (others => '0');
+    signal mac_sum_reg : signed(47 downto 0) := (others => '0');
+    
+    type prod_array_t is array (0 to 8) of signed(31 downto 0);
+    signal prods : prod_array_t := (others => (others => '0'));
+
+    -- NEW: Expanded pipeline tracker (5 stages now: 0 to 4)
+    type pipeline_track_t is array (0 to 4) of integer range -1 to NUM_OUT_CH;
+    signal oc_pipe : pipeline_track_t := (others => -1);
+    signal oc_req  : integer range 0 to NUM_OUT_CH := 0;
+    
+    type accum_array_t is array (0 to NUM_OUT_CH - 1) of signed(47 downto 0);
+    signal accums : accum_array_t := (others => (others => '0'));
+    
+    signal out_ch_cnt : integer range 0 to NUM_OUT_CH := 0;
+
+begin
+
+    weight_inst : entity work.weight_rom
+        generic map(WORD_WIDTH => 144, DEPTH => NUM_OUT_CH * NUM_IN_CH, INIT_FILE => WEIGHT_FILE)
+        port map(clk => clk, addr => rom_addr, dout => rom_dout);
+
+    bias_inst : entity work.weight_rom
+        generic map(WORD_WIDTH => 16, DEPTH => NUM_OUT_CH, INIT_FILE => BIAS_FILE)
+        port map(clk => clk, addr => bias_addr, dout => bias_dout);
+
+    process(rom_dout)
+    begin
+        for i in 0 to 8 loop
+            real_weights(i) <= signed(rom_dout((i+1)*16-1 downto i*16));
+        end loop;
+    end process;
+
+    in_ready  <= '1' when state = SHIFT_IN else '0';
+
+    process(clk)
+        variable temp_accum   : signed(47 downto 0);
+        variable temp_shifted : signed(47 downto 0);
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                state <= SHIFT_IN;
+                col_cnt <= 0; row_cnt <= 0; ic_cnt <= 0; rd_addr <= 0;
+                oc_pipe <= (others => -1); oc_req <= 0; out_ch_cnt <= 0;
+                out_valid <= '0';
+                out_data <= (others => '0');
+            else
+                case state is
+                    when SHIFT_IN =>
+                        out_valid <= '0'; 
+                        if in_valid = '1' then
+                            line_buf_1(rd_addr) <= signed(in_data);
+                            line_buf_2(rd_addr) <= line_buf_1(rd_addr);
+                            
+                            delay_row0(1 to DELAY_LEN) <= delay_row0(0 to DELAY_LEN - 1); delay_row0(0) <= line_buf_2(rd_addr);
+                            delay_row1(1 to DELAY_LEN) <= delay_row1(0 to DELAY_LEN - 1); delay_row1(0) <= line_buf_1(rd_addr);
+                            delay_row2(1 to DELAY_LEN) <= delay_row2(0 to DELAY_LEN - 1); delay_row2(0) <= signed(in_data);
+                            
+                            if rd_addr = BUF_DEPTH - 1 then rd_addr <= 0; else rd_addr <= rd_addr + 1; end if;
+
+                            if row_cnt >= 2 and col_cnt >= 2 then
+                                state <= CALC_MAC;
+                                oc_req <= 0;
+                                oc_pipe <= (others => -1);
+                            else
+                                if ic_cnt = NUM_IN_CH - 1 then
+                                    ic_cnt <= 0;
+                                    if col_cnt = IMG_W - 1 then
+                                        col_cnt <= 0;
+                                        if row_cnt = IMG_H - 1 then row_cnt <= 0; else row_cnt <= row_cnt + 1; end if;
+                                    else col_cnt <= col_cnt + 1; end if;
+                                else ic_cnt <= ic_cnt + 1; end if;
+                            end if;
+                        end if;
+
+                    when CALC_MAC =>
+                        -- Pipeline Stage 0: Issue Memory Addresses
+                        if oc_req < NUM_OUT_CH then
+                            rom_addr  <= std_logic_vector(to_unsigned(oc_req * NUM_IN_CH + ic_cnt, 32));
+                            bias_addr <= std_logic_vector(to_unsigned(oc_req, 32)); 
+                            oc_pipe(0) <= oc_req;
+                            oc_req <= oc_req + 1;
+                        else
+                            oc_pipe(0) <= -1;
+                        end if;
+
+                        -- Pipeline Stage 1: Wait for BRAM latency, then Multiply
+                        oc_pipe(1) <= oc_pipe(0);
+                        if oc_pipe(1) >= 0 then
+                            prods(0) <= delay_row0(2 * NUM_IN_CH) * real_weights(0);
+                            prods(1) <= delay_row0(NUM_IN_CH)     * real_weights(1);
+                            prods(2) <= delay_row0(0)             * real_weights(2);
+                            prods(3) <= delay_row1(2 * NUM_IN_CH) * real_weights(3);
+                            prods(4) <= delay_row1(NUM_IN_CH)     * real_weights(4);
+                            prods(5) <= delay_row1(0)             * real_weights(5);
+                            prods(6) <= delay_row2(2 * NUM_IN_CH) * real_weights(6);
+                            prods(7) <= delay_row2(NUM_IN_CH)     * real_weights(7);
+                            prods(8) <= delay_row2(0)             * real_weights(8);
+                            bias_reg_1 <= signed(bias_dout);
+                        end if;
+
+                        -- Pipeline Stage 2: Binary Adder Tree (Part 1 - Partial Sums)
+                        oc_pipe(2) <= oc_pipe(1);
+                        if oc_pipe(2) >= 0 then
+                            sum_A <= resize(prods(0),48) + resize(prods(1),48) + resize(prods(2),48) + resize(prods(3),48);
+                            sum_B <= resize(prods(4),48) + resize(prods(5),48) + resize(prods(6),48) + resize(prods(7),48);
+                            sum_C <= resize(prods(8),48);
+                            bias_reg_2 <= bias_reg_1; 
+                        end if;
+
+                        -- Pipeline Stage 3: Binary Adder Tree (Part 2 - Final MAC Sum)
+                        oc_pipe(3) <= oc_pipe(2);
+                        if oc_pipe(3) >= 0 then
+                            mac_sum_reg <= sum_A + sum_B + sum_C;
+                            bias_reg_3 <= bias_reg_2;
+                        end if;
+
+                        -- Pipeline Stage 4: Accumulation
+                        oc_pipe(4) <= oc_pipe(3);
+                        if oc_pipe(4) >= 0 then
+                            if ic_cnt = 0 then
+                                accums(oc_pipe(4)) <= mac_sum_reg + shift_left(resize(bias_reg_3, 48), 8); 
+                            else
+                                accums(oc_pipe(4)) <= accums(oc_pipe(4)) + mac_sum_reg; 
+                            end if;
+                        end if;
+
+                        -- Flow Control: Triggered on final stage of pipeline (Stage 4)
+                        if oc_pipe(4) = NUM_OUT_CH - 1 then
+                            if ic_cnt = NUM_IN_CH - 1 then
+                                state <= PRE_STREAM;
+                                out_ch_cnt <= 0;
+                            else
+                                state <= SHIFT_IN;
+                            end if;
+                            
+                            if ic_cnt = NUM_IN_CH - 1 then
+                                ic_cnt <= 0;
+                                if col_cnt = IMG_W - 1 then
+                                    col_cnt <= 0;
+                                    if row_cnt = IMG_H - 1 then row_cnt <= 0; else row_cnt <= row_cnt + 1; end if;
+                                else col_cnt <= col_cnt + 1; end if;
+                            else ic_cnt <= ic_cnt + 1; end if;
+                        end if;
+
+                    when PRE_STREAM =>
+                        temp_accum := accums(out_ch_cnt);
+                        temp_shifted := shift_right(temp_accum, 8);
+                        if temp_shifted < 0 then
+                            out_data <= (others => '0'); 
+                        elsif temp_shifted > 32767 then
+                            out_data <= std_logic_vector(to_signed(32767, 16)); 
+                        else
+                            out_data <= std_logic_vector(resize(temp_shifted, 16));
+                        end if;
+                        out_valid <= '1';
+                        state <= STREAM_OUT;
+
+                    when STREAM_OUT =>
+                        if out_ready = '1' then
+                            if out_ch_cnt = NUM_OUT_CH - 1 then
+                                out_valid <= '0';
+                                state <= SHIFT_IN;
+                            else
+                                out_ch_cnt <= out_ch_cnt + 1;
+                                temp_accum := accums(out_ch_cnt + 1);
+                                temp_shifted := shift_right(temp_accum, 8);
+                                if temp_shifted < 0 then
+                                    out_data <= (others => '0');
+                                elsif temp_shifted > 32767 then
+                                    out_data <= std_logic_vector(to_signed(32767, 16));
+                                else
+                                    out_data <= std_logic_vector(resize(temp_shifted, 16));
+                                end if;
+                            end if;
+                        end if;
+                        
+                end case;
+            end if;
+        end if;
+    end process;
+end architecture;
+\end{lstlisting}
+
+\subsection{pool_layer.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.cnn_config.all;
+
+entity pool_layer is
+    generic (
+        IMG_W    : integer := 32;
+        IMG_H    : integer := 32;
+        CHANNELS : integer := 16
+    );
+    port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        
+        in_data     : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        in_valid    : in  std_logic;
+        in_ready    : out std_logic;
+        
+        out_data    : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        out_valid   : out std_logic;
+        out_ready   : in  std_logic
+    );
+end entity;
+
+architecture rtl of pool_layer is
+    signal col_cnt : integer range 0 to IMG_W - 1 := 0;
+    signal row_cnt : integer range 0 to IMG_H - 1 := 0;
+    signal ch_cnt  : integer range 0 to CHANNELS - 1 := 0;
+
+    constant BUF_DEPTH : integer := IMG_W * CHANNELS;
+    type ram_type is array (0 to BUF_DEPTH - 1) of signed(DATA_WIDTH-1 downto 0);
+    signal line_buf : ram_type := (others => (others => '0'));
+
+    type max_array_t is array (0 to CHANNELS - 1) of signed(DATA_WIDTH-1 downto 0);
+    signal prev_max_col : max_array_t := (others => (others => '0'));
+
+    -- Pipelining signals (Stage 1 to Stage 2)
+    signal current_pixel_reg  : signed(DATA_WIDTH-1 downto 0) := (others => '0');
+    signal buffered_pixel_reg : signed(DATA_WIDTH-1 downto 0) := (others => '0');
+    signal valid_pipe         : std_logic := '0';
+    signal is_output_pipe     : boolean := false;
+    signal ch_cnt_pipe        : integer range 0 to CHANNELS - 1 := 0;
+    signal col_even_pipe      : boolean := false;
+
+    -- Stage 2 Combinational signals
+    signal current_max_col    : signed(DATA_WIDTH-1 downto 0);
+    signal is_output_pixel    : boolean;
+    signal stall_pipeline     : std_logic;
+
+begin
+    -- ========================================================================
+    -- Combinational Logic
+    -- ========================================================================
+    
+    -- Identify if the incoming coordinate is a pooling output trigger (Odd row AND Odd col)
+    is_output_pixel <= ((row_cnt mod 2) = 1 and (col_cnt mod 2) = 1);
+
+    -- Flow Control: Stall if Stage 2 holds a valid output pixel, but downstream is NOT ready.
+    stall_pipeline <= '1' when (valid_pipe = '1' and is_output_pipe and out_ready = '0') else '0';
+
+    -- Input Ready: We can accept new data if the pipeline isn't stalled.
+    in_ready <= '1' when (stall_pipeline = '0') else '0';
+
+    -- Stage 2 Combinational Datapath
+    current_max_col <= current_pixel_reg when current_pixel_reg > buffered_pixel_reg else buffered_pixel_reg;
+
+    -- Output assignment (Stage 2)
+    out_valid <= '1' when (valid_pipe = '1' and is_output_pipe) else '0';
+    out_data  <= std_logic_vector(current_max_col) when (current_max_col > prev_max_col(ch_cnt_pipe)) 
+                 else std_logic_vector(prev_max_col(ch_cnt_pipe));
+
+    -- ========================================================================
+    -- Synchronous Process
+    -- ========================================================================
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                col_cnt        <= 0;
+                row_cnt        <= 0;
+                ch_cnt         <= 0;
+                prev_max_col   <= (others => (others => '0'));
+                valid_pipe     <= '0';
+                is_output_pipe <= false;
+                col_even_pipe  <= false;
+            else
+                -- Proceed only if the pipeline is not stalled
+                if stall_pipeline = '0' then
+                    
+                    -- --------------------------------------------------------
+                    -- RETIRE STAGE 2
+                    -- --------------------------------------------------------
+                    -- Pipeline Left Column Max on even columns using Stage 2 data
+                    if valid_pipe = '1' and col_even_pipe then
+                        prev_max_col(ch_cnt_pipe) <= current_max_col;
+                    end if;
+
+                    -- --------------------------------------------------------
+                    -- ADVANCE STAGE 1 -> STAGE 2
+                    -- --------------------------------------------------------
+                    if in_valid = '1' then
+                        -- Latch data and control into pipeline registers
+                        buffered_pixel_reg <= line_buf(col_cnt * CHANNELS + ch_cnt);
+                        current_pixel_reg  <= signed(in_data);
+                        ch_cnt_pipe        <= ch_cnt;
+                        is_output_pipe     <= is_output_pixel;
+                        col_even_pipe      <= ((col_cnt mod 2) = 0);
+                        valid_pipe         <= '1';
+                        
+                        -- Update Line Buffer on even rows
+                        if (row_cnt mod 2) = 0 then
+                            line_buf(col_cnt * CHANNELS + ch_cnt) <= signed(in_data);
+                        end if;
+
+                        -- Interleaved Counter Logic
+                        if ch_cnt = CHANNELS - 1 then
+                            ch_cnt <= 0;
+                            if col_cnt = IMG_W - 1 then
+                                col_cnt <= 0;
+                                if row_cnt = IMG_H - 1 then
+                                    row_cnt <= 0;
+                                else
+                                    row_cnt <= row_cnt + 1;
+                                end if;
+                            else
+                                col_cnt <= col_cnt + 1;
+                            end if;
+                        else
+                            ch_cnt <= ch_cnt + 1;
+                        end if;
+                    else
+                        -- No valid input, pipeline bubble
+                        valid_pipe <= '0';
+                    end if;
+                end if;
+            end if;
+        end if;
+    end process;
+end architecture;
+\end{lstlisting}
+
+\subsection{padder.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.cnn_config.all;
+
+entity padder is
+    generic (
+        IMG_W    : integer := 32;
+        IMG_H    : integer := 32;
+        CHANNELS : integer := 16
+    );
+    port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        in_data     : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        in_valid    : in  std_logic;
+        in_ready    : out std_logic;
+        out_data    : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        out_valid   : out std_logic;
+        out_ready   : in  std_logic
+    );
+end entity;
+
+architecture rtl of padder is
+    type state_type is (IDLE, STREAMING);
+    signal state : state_type := IDLE;
+    
+    -- Counters map the new dimensions (e.g., 18x18 instead of 16x16)
+    signal col_cnt : integer range 0 to IMG_W + 1 := 0;
+    signal row_cnt : integer range 0 to IMG_H + 1 := 0;
+    signal ch_cnt  : integer range 0 to CHANNELS - 1 := 0;
+    
+    signal is_pad  : std_logic;
+begin
+
+    -- Geographical check: Are we in the 1-pixel zero border?
+    is_pad <= '1' when (row_cnt = 0 or row_cnt = IMG_H + 1 or col_cnt = 0 or col_cnt = IMG_W + 1) else '0';
+
+    -- Handshake Wiring
+    -- We are only ready to accept real data if we are NOT in a padding region AND the downstream is ready
+    in_ready  <= out_ready when (state = STREAMING and is_pad = '0') else '0';
+    
+    -- We are valid if we are streaming padding zeros, OR if we are streaming real data and the input is valid
+    out_valid <= '1'       when (state = STREAMING and is_pad = '1') else
+                 in_valid  when (state = STREAMING and is_pad = '0') else '0';
+                 
+    -- Multiplex the output data between zeros and the actual input stream
+    out_data  <= (others => '0') when is_pad = '1' else in_data;
+
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                state   <= IDLE;
+                col_cnt <= 0;
+                row_cnt <= 0;
+                ch_cnt  <= 0;
+            else
+                case state is
+                    when IDLE =>
+                        -- Wait for the very first pixel of a new image to arrive before turning on the tap
+                        if in_valid = '1' then
+                            state <= STREAMING;
+                        end if;
+
+                    when STREAMING =>
+                        -- Advance counters ONLY when a successful transmission happens
+                        if (out_ready = '1' and is_pad = '1') or (out_ready = '1' and in_valid = '1' and is_pad = '0') then
+                            
+                            if ch_cnt = CHANNELS - 1 then
+                                ch_cnt <= 0;
+                                
+                                if col_cnt = IMG_W + 1 then
+                                    col_cnt <= 0;
+                                    
+                                    if row_cnt = IMG_H + 1 then
+                                        row_cnt <= 0;
+                                        state   <= IDLE; -- Finished sending the entire padded image
+                                    else
+                                        row_cnt <= row_cnt + 1;
+                                    end if;
+                                else
+                                    col_cnt <= col_cnt + 1;
+                                end if;
+                            else
+                                ch_cnt <= ch_cnt + 1;
+                            end if;
+                        end if;
+                end case;
+            end if;
+        end if;
+    end process;
+
+end architecture;
+\end{lstlisting}
+
+\subsection{flatten.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.cnn_config.all;
+
+entity flatten is
+    port (
+        clk          : in  std_logic;
+        reset        : in  std_logic;
+        
+        -- Input Stream (From Pool3)
+        in_data      : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        in_valid     : in  std_logic;
+        in_ready     : out std_logic;
+        
+        -- Output Stream (To Dense1)
+        out_data     : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        out_valid    : out std_logic;
+        out_ready    : in  std_logic;
+        
+        -- Status Flag
+        flatten_done : out std_logic
+    );
+end entity;
+
+architecture rtl of flatten is
+    -- Counter sized perfectly for the flatten size defined in your config
+    signal count : integer range 0 to FLATTEN_SIZE := 0;
+begin
+    
+    -- 1. Pure Combinatorial Pass-Through
+    out_data  <= in_data;
+    out_valid <= in_valid;
+    in_ready  <= out_ready;
+
+    -- 2. Synchronous Counting Logic
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                count <= 0;
+                flatten_done <= '0';
+            else
+                -- Default state: no pulse
+                flatten_done <= '0'; 
+                
+                -- Only count when data is actively transferring
+                if in_valid = '1' and out_ready = '1' then
+                    if count = FLATTEN_SIZE - 1 then
+                        count <= 0;
+                        flatten_done <= '1'; -- Pulse high for 1 cycle when a full map is flattened
+                    else
+                        count <= count + 1;
+                    end if;
+                end if;
+            end if;
+        end if;
+    end process;
+end architecture;
+\end{lstlisting}
+
+\subsection{dense_engine.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use std.textio.all;
+use ieee.std_logic_textio.all;
+use work.cnn_config.all;
+
+entity dense_engine is
+    generic (
+        IN_SIZE       : integer := 512;
+        OUT_SIZE      : integer := 32;
+        PARALLEL_MACS : integer := 8;
+        APPLY_RELU    : boolean := true;
+        BIAS_FILE     : string  := "dense1_biases.mem";
+        WEIGHT_FILE   : string  := "dense1_weights.mem"
+    );
+    port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        
+        in_data     : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        in_valid    : in  std_logic;
+        in_ready    : out std_logic;
+        
+        out_data    : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        out_valid   : out std_logic;
+        out_ready   : in  std_logic
+    );
+end entity;
+
+architecture rtl of dense_engine is
+    type state_type is (IDLE, LOAD_BUFFER, COMPUTE_WAIT, COMPUTE, FLUSH_MAC, DRAIN_OUT);
+    signal state : state_type := IDLE;
+
+    -- The Memory Array
+    type ram_type is array (0 to IN_SIZE - 1) of signed(DATA_WIDTH-1 downto 0);
+    signal input_buf : ram_type := (others => (others => '0'));
+    
+    attribute ram_style : string;
+    attribute ram_style of input_buf : signal is "block";
+    
+    signal p_in_reg  : signed(DATA_WIDTH-1 downto 0) := (others => '0');
+    signal ram_we    : std_logic;
+
+    signal load_idx  : integer range 0 to IN_SIZE := 0;
+
+    constant NUM_PASSES : integer := (OUT_SIZE + PARALLEL_MACS - 1) / PARALLEL_MACS; 
+    signal pass_idx     : integer range 0 to NUM_PASSES := 0;
+    
+    signal fetch_idx    : integer range 0 to IN_SIZE := 0;
+    signal compute_idx  : integer range 0 to IN_SIZE := 0;
+    
+    signal total_outputs_sent : integer range 0 to OUT_SIZE := 0;
+
+    type accum_array is array (0 to PARALLEL_MACS - 1) of signed(47 downto 0);
+    signal accums : accum_array := (others => (others => '0'));
+    
+    signal valid_prod : std_logic := '0';
+    signal prods_reg  : accum_array := (others => (others => '0'));
+
+    signal drain_idx : integer range 0 to PARALLEL_MACS := 0;
+
+    type bias_array is array (0 to OUT_SIZE - 1) of signed(15 downto 0);
+    
+    impure function init_bias(filename : string) return bias_array is
+        file f : text;
+        variable l : line;
+        variable w : std_logic_vector(15 downto 0);
+        variable res : bias_array := (others => (others => '0'));
+    begin
+        file_open(f, filename, read_mode);
+        for i in 0 to OUT_SIZE - 1 loop
+            if not endfile(f) then
+                readline(f, l);
+                hread(l, w);
+                res(i) := signed(w);
+            end if;
+        end loop;
+        file_close(f);
+        return res;
+    end function;
+    
+    signal biases : bias_array := init_bias(BIAS_FILE);
+
+    signal weight_addr : std_logic_vector(31 downto 0);
+    signal weight_data : std_logic_vector(PARALLEL_MACS * 16 - 1 downto 0);
+
+begin
+
+    u_weight_rom: entity work.weight_rom
+        generic map (
+            WORD_WIDTH => PARALLEL_MACS * 16,
+            DEPTH      => NUM_PASSES * IN_SIZE,
+            INIT_FILE  => WEIGHT_FILE
+        )
+        port map (
+            clk  => clk,
+            addr => weight_addr,
+            dout => weight_data
+        );
+
+    in_ready <= '1' when (state = IDLE or state = LOAD_BUFFER) and load_idx < IN_SIZE else '0';
+    
+    weight_addr <= std_logic_vector(to_unsigned(pass_idx * IN_SIZE + fetch_idx, 32));
+
+    -- =========================================================
+    -- THE FIX: DEDICATED BRAM PROCESS
+    -- This perfectly matches the Xilinx synchronous RAM template
+    -- =========================================================
+    ram_we <= '1' when (state = IDLE or state = LOAD_BUFFER) and in_valid = '1' else '0';
+
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            -- Port A: Write
+            if ram_we = '1' then
+                input_buf(load_idx) <= signed(in_data);
+            end if;
+            
+            -- Port B: Read (Free-running, perfectly pipeline aligned)
+            p_in_reg <= input_buf(fetch_idx);
+        end if;
+    end process;
+
+
+    -- =========================================================
+    -- MAIN CONTROL FSM
+    -- =========================================================
+    process(clk)
+        variable final_val : signed(47 downto 0);
+        variable shifted_val : signed(47 downto 0);
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                state <= IDLE;
+                load_idx <= 0; pass_idx <= 0; 
+                fetch_idx <= 0; compute_idx <= 0;
+                drain_idx <= 0;
+                valid_prod <= '0';
+                total_outputs_sent <= 0;
+                accums <= (others => (others => '0'));
+                prods_reg <= (others => (others => '0'));
+                out_valid <= '0'; out_data <= (others => '0');
+            else
+                out_valid <= '0'; 
+
+                case state is
+                    when IDLE =>
+                        load_idx <= 0;
+                        total_outputs_sent <= 0;
+                        if in_valid = '1' then
+                            load_idx <= 1;
+                            state <= LOAD_BUFFER;
+                        end if;
+
+                    when LOAD_BUFFER =>
+                        if in_valid = '1' then
+                            if load_idx = IN_SIZE - 1 then
+                                state <= COMPUTE_WAIT; 
+                                pass_idx <= 0;
+                                fetch_idx <= 0;
+                                compute_idx <= 0;
+                                valid_prod <= '0';
+                                accums <= (others => (others => '0'));
+                            else
+                                load_idx <= load_idx + 1;
+                            end if;
+                        end if;
+
+                    when COMPUTE_WAIT =>
+                        fetch_idx <= 1;
+                        compute_idx <= 0;
+                        valid_prod <= '0';
+                        state <= COMPUTE;
+
+                    when COMPUTE =>
+                        for i in 0 to PARALLEL_MACS - 1 loop
+                            prods_reg(i) <= resize(p_in_reg * signed(weight_data((i+1)*16-1 downto i*16)), 48); 
+                        end loop;
+                        valid_prod <= '1';
+
+                        if valid_prod = '1' then
+                            for i in 0 to PARALLEL_MACS - 1 loop
+                                accums(i) <= accums(i) + prods_reg(i);
+                            end loop;
+                        end if;
+
+                        if compute_idx = IN_SIZE - 1 then
+                            state <= FLUSH_MAC; 
+                        else
+                            compute_idx <= compute_idx + 1;
+                            if fetch_idx < IN_SIZE - 1 then
+                                fetch_idx <= fetch_idx + 1;
+                            end if;
+                        end if;
+
+                    when FLUSH_MAC =>
+                        if valid_prod = '1' then
+                            for i in 0 to PARALLEL_MACS - 1 loop
+                                accums(i) <= accums(i) + prods_reg(i);
+                            end loop;
+                        end if;
+                        valid_prod <= '0';
+                        state <= DRAIN_OUT;
+                        drain_idx <= 0;
+
+                    when DRAIN_OUT =>
+                        if out_ready = '1' then
+                            out_valid <= '1';
+                            final_val := accums(drain_idx) + shift_left(resize(biases(total_outputs_sent), 48), 8);
+                            shifted_val := shift_right(final_val, 8);
+
+                            if APPLY_RELU and shifted_val < 0 then
+                                out_data <= (others => '0');
+                            elsif shifted_val > 32767 then
+                                out_data <= std_logic_vector(to_signed(32767, 16));
+                            elsif shifted_val < -32768 then
+                                out_data <= std_logic_vector(to_signed(-32768, 16));
+                            else
+                                out_data <= std_logic_vector(resize(shifted_val, 16));
+                            end if;
+
+                            if total_outputs_sent = OUT_SIZE - 1 then
+                                state <= IDLE;
+                                total_outputs_sent <= 0;
+                            elsif drain_idx = PARALLEL_MACS - 1 then
+                                if pass_idx < NUM_PASSES - 1 then
+                                    state <= COMPUTE_WAIT; 
+                                    pass_idx <= pass_idx + 1;
+                                    fetch_idx <= 0;
+                                    compute_idx <= 0;
+                                    accums <= (others => (others => '0'));
+                                    drain_idx <= 0;
+                                    total_outputs_sent <= total_outputs_sent + 1;
+                                else
+                                    state <= IDLE;
+                                end if;
+                            else
+                                drain_idx <= drain_idx + 1;
+                                total_outputs_sent <= total_outputs_sent + 1;
+                            end if;
+                        end if;
+                end case;
+            end if;
+        end if;
+    end process;
+end architecture;
+\end{lstlisting}
+
+\subsection{spi_controller.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+entity spi_controller is
+    Generic (
+        G_TX_WIDTH : integer := 8;
+        G_RX_WIDTH : integer := 8
+    );
+    Port (
+        clk_100mhz : in  STD_LOGIC;
+        reset      : in  STD_LOGIC;
+        
+        -- Asynchronous SPI Pins from Raspberry Pi
+        spi_cs_n   : in  STD_LOGIC;
+        spi_sclk   : in  STD_LOGIC;
+        spi_mosi   : in  STD_LOGIC;
+        spi_miso   : out STD_LOGIC;
+        
+        -- Interface to Top Module
+        tx_data    : in  STD_LOGIC_VECTOR(G_TX_WIDTH-1 downto 0);
+        tx_load    : in  STD_LOGIC;
+        rx_data    : out STD_LOGIC_VECTOR(G_RX_WIDTH-1 downto 0);
+        rx_valid   : out STD_LOGIC
+    );
+end spi_controller;
+
+architecture Behavioral of spi_controller is
+    -- Synchronization Registers
+    signal cs_sync   : STD_LOGIC_VECTOR(1 downto 0) := "11";
+    signal sclk_sync : STD_LOGIC_VECTOR(2 downto 0) := "000"; -- 3 bits for edge detection
+    signal mosi_sync : STD_LOGIC_VECTOR(1 downto 0) := "00";
+
+    -- Internal signals
+    signal sclk_rise : STD_LOGIC;
+    signal sclk_fall : STD_LOGIC;
+    signal cs_n_safe : STD_LOGIC;
+    signal mosi_safe : STD_LOGIC;
+
+begin
+
+    -- Clock Domain Crossing (CDC) & Edge Detection Process
+    process(clk_100mhz)
+    begin
+        if rising_edge(clk_100mhz) then
+            if reset = '1' then
+                cs_sync   <= "11";
+                sclk_sync <= "000";
+                mosi_sync <= "00";
+            else
+                -- Shift registers for 2-flop synchronization
+                cs_sync   <= cs_sync(0) & spi_cs_n;
+                sclk_sync <= sclk_sync(1 downto 0) & spi_sclk;
+                mosi_sync <= mosi_sync(0) & spi_mosi;
+            end if;
+        end if;
+    end process;
+
+    -- Map safe synchronized signals
+    cs_n_safe <= cs_sync(1);
+    mosi_safe <= mosi_sync(1);
+
+    -- Edge detection logic using the 3rd flop stage
+    sclk_rise <= '1' when (sclk_sync(2 downto 1) = "01") else '0';
+    sclk_fall <= '1' when (sclk_sync(2 downto 1) = "10") else '0';
+
+    -- Instantiate Receiver
+    Inst_Receiver: entity work.spi_receiver
+        generic map ( G_DATA_WIDTH => G_RX_WIDTH )
+        port map (
+            clk_100mhz => clk_100mhz,
+            reset      => reset,
+            cs_n_sync  => cs_n_safe,
+            sclk_rise  => sclk_rise,
+            mosi_sync  => mosi_safe,
+            rx_data    => rx_data,
+            rx_valid   => rx_valid
+        );
+
+    -- Instantiate Transmitter
+    Inst_Transmitter: entity work.spi_transmitter
+        generic map ( G_DATA_WIDTH => G_TX_WIDTH )
+        port map (
+            clk_100mhz => clk_100mhz,
+            reset      => reset,
+            cs_n_sync  => cs_n_safe,
+            sclk_fall  => sclk_fall,
+            tx_data    => tx_data,
+            tx_load    => tx_load,
+            miso       => spi_miso
+        );
+
+end Behavioral;
+\end{lstlisting}
+
+\subsection{spi_receiver.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity spi_receiver is
+    Generic ( G_DATA_WIDTH : integer := 32 );
+    Port (
+        clk_100mhz : in STD_LOGIC;
+        reset      : in STD_LOGIC;
+        cs_n_sync  : in STD_LOGIC; -- Synchronized Active-Low Chip Select
+        sclk_rise  : in STD_LOGIC; -- 1-tick pulse when SCLK goes from 0 to 1
+        mosi_sync  : in STD_LOGIC; -- Synchronized MOSI data
+        rx_data    : out STD_LOGIC_VECTOR(G_DATA_WIDTH-1 downto 0);
+        rx_valid   : out STD_LOGIC -- Pulses HIGH for 1 clock cycle when data is fully received
+    );
+end spi_receiver;
+
+architecture Behavioral of spi_receiver is
+    signal shift_reg : STD_LOGIC_VECTOR(G_DATA_WIDTH-1 downto 0) := (others => '0');
+    signal bit_count : integer range 0 to G_DATA_WIDTH := 0;
+begin
+    process(clk_100mhz)
+    begin
+        if rising_edge(clk_100mhz) then
+            if reset = '1' or cs_n_sync = '1' then
+                -- CS going High acts as a hard reset for the SPI transaction
+                bit_count <= 0;
+                rx_valid <= '0';
+            else
+                rx_valid <= '0'; -- Default state
+                
+                if sclk_rise = '1' then
+                    -- Shift data to the left (MSB first)
+                    shift_reg <= shift_reg(G_DATA_WIDTH-2 downto 0) & mosi_sync;
+                    bit_count <= bit_count + 1;
+                    
+                    -- Check if we received the full word
+                    if bit_count = G_DATA_WIDTH - 1 then
+                        rx_data <= shift_reg(G_DATA_WIDTH-2 downto 0) & mosi_sync;
+                        rx_valid <= '1';
+                        bit_count <= 0; -- Reset for the next word
+                    end if;
+                end if;
+            end if;
+        end if;
+    end process;
+end Behavioral;
+\end{lstlisting}
+
+\subsection{spi_transmitter.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity spi_transmitter is
+    Generic ( G_DATA_WIDTH : integer := 32 );
+    Port (
+        clk_100mhz : in STD_LOGIC;
+        reset      : in STD_LOGIC;
+        cs_n_sync  : in STD_LOGIC;
+        sclk_fall  : in STD_LOGIC; -- 1-tick pulse when SCLK goes from 1 to 0
+        tx_data    : in STD_LOGIC_VECTOR(G_DATA_WIDTH-1 downto 0);
+        tx_load    : in STD_LOGIC; -- Tells the module to latch new data to send
+        miso       : out STD_LOGIC
+    );
+end spi_transmitter;
+
+architecture Behavioral of spi_transmitter is
+    signal shift_reg : STD_LOGIC_VECTOR(G_DATA_WIDTH-1 downto 0) := (others => '0');
+    signal miso_internal : STD_LOGIC := '0';
+begin
+    process(clk_100mhz)
+    begin
+        if rising_edge(clk_100mhz) then
+            if reset = '1' then
+                shift_reg <= (others => '0');
+            elsif tx_load = '1' then
+                -- Load the new data from the Top Module when ready
+                shift_reg <= tx_data;
+            elsif cs_n_sync = '0' then
+                -- When CS is low, shift data out on the falling edge
+                if sclk_fall = '1' then
+                    shift_reg <= shift_reg(G_DATA_WIDTH-2 downto 0) & '0';
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- Push the Most Significant Bit (MSB) to the wire
+    miso_internal <= shift_reg(G_DATA_WIDTH-1);
+    
+    -- Tristate MISO when CS is high (standard SPI practice)
+    miso <= miso_internal when cs_n_sync = '0' else 'Z';
+
+end Behavioral;
+\end{lstlisting}
+
+\subsection{sync_fifo.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity sync_fifo is
+    generic (
+        DATA_WIDTH : integer := 8;
+        ADDR_WIDTH : integer := 4 -- 16-byte buffer is plenty for SPI speeds
+    );
+    port (
+        clk      : in  std_logic;
+        reset    : in  std_logic;
+        wr_en    : in  std_logic;
+        wr_data  : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        rd_en    : in  std_logic;
+        rd_data  : out std_logic_vector(DATA_WIDTH-1 downto 0);
+        empty    : out std_logic;
+        full     : out std_logic
+    );
+end entity;
+
+architecture rtl of sync_fifo is
+    type ram_type is array (0 to (2**ADDR_WIDTH)-1) of std_logic_vector(DATA_WIDTH-1 downto 0);
+    signal mem : ram_type := (others => (others => '0'));
+    
+    signal wr_ptr, rd_ptr : unsigned(ADDR_WIDTH-1 downto 0) := (others => '0');
+    signal count : integer range 0 to 2**ADDR_WIDTH := 0;
+begin
+    full  <= '1' when count = 2**ADDR_WIDTH else '0';
+    empty <= '1' when count = 0 else '0';
+    
+    rd_data <= mem(to_integer(rd_ptr));
+
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                wr_ptr <= (others => '0');
+                rd_ptr <= (others => '0');
+                count  <= 0;
+            else
+                if wr_en = '1' and count < 2**ADDR_WIDTH then
+                    mem(to_integer(wr_ptr)) <= wr_data;
+                    wr_ptr <= wr_ptr + 1;
+                end if;
+                
+                if rd_en = '1' and count > 0 then
+                    rd_ptr <= rd_ptr + 1;
+                end if;
+                
+                if (wr_en = '1' and count < 2**ADDR_WIDTH) and not (rd_en = '1' and count > 0) then
+                    count <= count + 1;
+                elsif (rd_en = '1' and count > 0) and not (wr_en = '1' and count < 2**ADDR_WIDTH) then
+                    count <= count - 1;
+                end if;
+            end if;
+        end if;
+    end process;
+end architecture;
+\end{lstlisting}
+
+\subsection{weight_rom.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use std.textio.all;
+use ieee.std_logic_textio.all;
+
+entity weight_rom is
+    generic (
+        WORD_WIDTH : integer := 144; -- 9 weights * 16 bits
+        DEPTH      : integer := 16;  -- Number of filters/kernels
+        INIT_FILE  : string  := "conv1_weights.mem"
+    );
+    port (
+        clk  : in  std_logic;
+        addr : in  std_logic_vector(31 downto 0); 
+        dout : out std_logic_vector(WORD_WIDTH-1 downto 0)
+    );
+end entity;
+
+architecture rtl of weight_rom is
+    type rom_type is array (0 to DEPTH-1) of std_logic_vector(WORD_WIDTH-1 downto 0);
+
+    -- This function reads 9 lines from your script's output to fill 1 hardware word
+    impure function init_rom_from_16bit_file(file_name : string) return rom_type is
+        file romfile       : text;
+        variable romline   : line;
+        variable temp_mem  : rom_type := (others => (others => '0'));
+        variable temp_16bit : std_logic_vector(15 downto 0);
+        constant WORDS_PER_LINE : integer := WORD_WIDTH / 16;
+    begin
+        file_open(romfile, file_name, read_mode);
+        for i in 0 to DEPTH-1 loop
+            for j in 0 to WORDS_PER_LINE-1 loop
+                if not endfile(romfile) then
+                    readline(romfile, romline);
+                    hread(romline, temp_16bit); -- Reads hex like "0100"
+                    -- Packs it into the wide 144-bit kernel
+                    temp_mem(i)((j+1)*16-1 downto j*16) := temp_16bit;
+                end if;
+            end loop;
+        end loop;
+        file_close(romfile);
+        return temp_mem;
+    end function;
+
+    signal rom_data : rom_type := init_rom_from_16bit_file(INIT_FILE);
+    
+    -- Forces Vivado to use Block RAM as per Master Plan
+    attribute ram_style : string;
+    attribute ram_style of rom_data : signal is "block";
+begin
+    process(clk) begin
+        if rising_edge(clk) then
+            dout <= rom_data(to_integer(unsigned(addr)));
+        end if;
+    end process;
+end architecture;
+\end{lstlisting}
+
+\subsection{eth_cnn_bridge.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.cnn_config.all; -- Grabs NUM_CLASSES
+
+entity eth_cnn_bridge is
+    Generic (
+        RESPONSE_LEN : integer := NUM_CLASSES * 2 -- Automatically scales to 6 bytes
+    );
+    Port (
+        clk           : in STD_LOGIC;
+        reset_n       : in STD_LOGIC;
+        
+        s_rx_tdata    : in STD_LOGIC_VECTOR(7 downto 0);
+        s_rx_tvalid   : in STD_LOGIC;
+        s_rx_tlast    : in STD_LOGIC;
+        s_rx_tready   : out STD_LOGIC;
+        
+        m_tx_tdata    : out STD_LOGIC_VECTOR(7 downto 0);
+        m_tx_tvalid   : out STD_LOGIC;
+        m_tx_tlast    : out STD_LOGIC;
+        m_tx_tuser    : out STD_LOGIC_VECTOR(11 downto 0);
+        m_tx_tready   : in  STD_LOGIC
+    );
+end eth_cnn_bridge;
+
+architecture Behavioral of eth_cnn_bridge is
+
+    -- Reset signals
+    signal internal_fifo_reset : std_logic := '0';
+    signal fifo_reset_combined : std_logic;
+
+    signal rx_fifo_wr_en, rx_fifo_rd_en : std_logic;
+    signal rx_fifo_full, rx_fifo_empty  : std_logic;
+    signal rx_fifo_rd_data : std_logic_vector(7 downto 0);
+
+    signal cnn_in_data   : STD_LOGIC_VECTOR(15 downto 0);
+    signal cnn_in_valid, cnn_in_ready  : STD_LOGIC;
+    signal cnn_out_data  : STD_LOGIC_VECTOR(15 downto 0);
+    signal cnn_out_valid, cnn_out_ready : STD_LOGIC;
+
+    type tx_state_type is (IDLE, SEND_RESP);
+    signal tx_state : tx_state_type := IDLE;
+    signal tx_byte_count : integer range 0 to RESPONSE_LEN := 0;
+
+    signal class_idx : integer range 0 to NUM_CLASSES := 0;
+    type byte_array is array (0 to (NUM_CLASSES * 2) - 1) of std_logic_vector(7 downto 0);
+    signal tx_buffer : byte_array := (others => x"00");
+
+begin
+    -- The FIFO resets if a global hardware reset occurs OR an automatic flush pulse triggers
+    fifo_reset_combined <= (not reset_n) or internal_fifo_reset;
+
+    -- RX FIFO
+    u_rx_fifo: entity work.sync_fifo
+        generic map ( DATA_WIDTH => 8, ADDR_WIDTH => 11 )
+        port map ( 
+            clk     => clk, 
+            reset   => fifo_reset_combined, -- Modified port map connection
+            wr_en   => rx_fifo_wr_en, 
+            wr_data => s_rx_tdata, 
+            rd_en   => rx_fifo_rd_en, 
+            rd_data => rx_fifo_rd_data, 
+            empty   => rx_fifo_empty, 
+            full    => rx_fifo_full 
+        );
+
+    rx_fifo_wr_en <= s_rx_tvalid and (not rx_fifo_full);
+    s_rx_tready   <= not rx_fifo_full;
+    rx_fifo_rd_en <= cnn_in_ready and (not rx_fifo_empty);
+    cnn_in_valid  <= not rx_fifo_empty;
+    
+    cnn_in_data   <= x"00" & rx_fifo_rd_data;
+
+    -- CNN CORE
+    u_cnn_core: entity work.cnn_datapath_top
+        port map( 
+            clk       => clk, 
+            reset     => fifo_reset_combined, -- Core resets synchronously with the FIFO
+            in_data   => cnn_in_data, 
+            in_valid  => cnn_in_valid, 
+            in_ready  => cnn_in_ready, 
+            out_data  => cnn_out_data, 
+            out_valid => cnn_out_valid, 
+            out_ready => cnn_out_ready 
+        );
+        
+    cnn_out_ready <= '1'; 
+
+    m_tx_tuser <= std_logic_vector(to_unsigned(RESPONSE_LEN, 12));
+
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset_n = '0' then
+                tx_state            <= IDLE;
+                tx_byte_count       <= 0;
+                class_idx           <= 0;
+                internal_fifo_reset <= '0';
+            else
+                case tx_state is
+                    when IDLE =>
+                        internal_fifo_reset <= '0'; -- Deassert flush pulse immediately on entering IDLE
+                        
+                        if cnn_out_valid = '1' then
+                            tx_buffer(class_idx * 2)     <= cnn_out_data(15 downto 8);
+                            tx_buffer(class_idx * 2 + 1) <= cnn_out_data(7 downto 0);
+                            
+                            if class_idx = NUM_CLASSES - 1 then
+                                class_idx <= 0;
+                                tx_state  <= SEND_RESP;
+                            else
+                                class_idx <= class_idx + 1;
+                            end if;
+                        end if;
+
+                    when SEND_RESP =>
+                        if m_tx_tready = '1' then
+                            if tx_byte_count = RESPONSE_LEN - 1 then
+                                tx_state            <= IDLE;
+                                tx_byte_count       <= 0;
+                                internal_fifo_reset <= '1'; -- Pulse active high to flush leftover bytes
+                            else
+                                tx_byte_count       <= tx_byte_count + 1;
+                            end if;
+                        end if;
+                end case;
+            end if;
+        end if;
+    end process;
+
+    m_tx_tdata  <= tx_buffer(tx_byte_count);
+    m_tx_tvalid <= '1' when tx_state = SEND_RESP else '0';
+    m_tx_tlast  <= '1' when (tx_state = SEND_RESP and tx_byte_count = RESPONSE_LEN - 1) else '0';
+
+end Behavioral;
+\end{lstlisting}
+
+\subsection{tb_system.vhd}
+\begin{lstlisting}[language=VHDL]
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use std.textio.all;
+use ieee.std_logic_textio.all;
+
+entity tb_system is
+end entity;
+
+architecture sim of tb_system is
+
+    -- =========================================================
+    -- TEST CONFIGURATION
+    -- =========================================================
+    -- IMPORTANT: Set this to the absolute path where generate_testbench_data.py saves files.
+    -- Use forward slashes (/) for VHDL paths, even on Windows.
+    constant DATA_DIR   : string := "../../../../testbench_data/"; 
+    
+    -- Change this prefix to test different images (e.g., "cat", "dog", "human")
+    constant TEST_IMAGE : string := "cat"; 
+
+    -- =========================================================
+    -- CLOCKS & TIMEOUTS
+    -- =========================================================
+    constant SYS_CLK_PERIOD : time := 10 ns;   -- 100 MHz FPGA Clock
+    constant SPI_CLK_HALF   : time := 50 ns;   -- 10 MHz SPI Clock
+    constant TIMEOUT        : time := 50 ms;   -- Failsafe timeout
+
+    -- UUT Signals
+    signal clk_100mhz : std_logic := '0';
+    signal reset_n    : std_logic := '0';
+    signal spi_cs_n   : std_logic := '1';
+    signal spi_sclk   : std_logic := '0';
+    signal spi_mosi   : std_logic := '0';
+    signal spi_miso   : std_logic;
+    signal data_ready : std_logic;
+
+    -- Simulation Tracking
+    signal sim_done : boolean := false;
+
+    -- 3-Class Arrays for Verification
+    type logit_array is array (0 to 2) of std_logic_vector(15 downto 0);
+    signal expected_logits : logit_array := (others => (others => '0'));
+    signal received_logits : logit_array := (others => (others => '0'));
+    -- Add this signal right below your other signals
+    signal led : std_logic_vector(15 downto 0);
+
+begin
+
+    -- 100 MHz System Clock Generation
+    clk_100mhz <= not clk_100mhz after SYS_CLK_PERIOD/2 when not sim_done else '0';
+
+    -- ... Inside your architecture ...
+    uut: entity work.system_top
+        port map (
+            clk_100mhz => clk_100mhz,
+            reset_n    => reset_n,
+            spi_cs_n   => spi_cs_n,
+            spi_sclk   => spi_sclk,
+            spi_mosi   => spi_mosi,
+            spi_miso   => spi_miso,
+            data_ready => data_ready,
+            led        => led  -- Mapped the new port!
+        );
+
+    -- =========================================================
+    -- MAIN STIMULUS (THE RASPBERRY PI ROLEPLAY)
+    -- =========================================================
+    pi_sim_proc: process
+        file f_expected  : text;
+        file f_in        : text;
+        variable l       : line;
+        variable hex_val : std_logic_vector(15 downto 0);
+        variable rx_word : std_logic_vector(15 downto 0);
+        variable errors  : integer := 0;
+        
+        -- Inline Procedure to act as the SPI Master (Mode 0: CPOL=0, CPHA=0)
+        procedure spi_transfer_16(
+            tx_data : in  std_logic_vector(15 downto 0);
+            rx_data : out std_logic_vector(15 downto 0)
+        ) is
+        begin
+            for i in 15 downto 0 loop
+                -- 1. Setup data on MOSI
+                spi_mosi <= tx_data(i);
+                wait for SPI_CLK_HALF;
+                
+                -- 2. Rising Edge (Sample MISO)
+                spi_sclk <= '1';
+                rx_data(i) := spi_miso;
+                wait for SPI_CLK_HALF;
+                
+                -- 3. Falling Edge
+                spi_sclk <= '0';
+            end loop;
+        end procedure;
+
+    begin
+        report "==================================================";
+        report "--- STARTING SYSTEM LEVEL SPI TESTBENCH ---";
+        report "Testing Image Prefix: " & TEST_IMAGE;
+        report "==================================================";
+
+        -- 1. Load Expected Golden Logits
+        report "Loading expected logits from Golden Model...";
+        file_open(f_expected, DATA_DIR & TEST_IMAGE & "_11_logits.hex", read_mode);
+        for i in 0 to 2 loop
+            readline(f_expected, l);
+            hread(l, hex_val);
+            expected_logits(i) <= hex_val;
+        end loop;
+        file_close(f_expected);
+
+        -- 2. Hardware Reset
+        reset_n  <= '0';
+        spi_cs_n <= '1';
+        spi_sclk <= '0';
+        spi_mosi <= '0';
+        wait for 200 ns;
+        reset_n  <= '1';
+        wait for 200 ns;
+
+        -- 3. Start SPI Transaction
+        report "Initiating SPI Transaction (Lowering CS_N)...";
+        spi_cs_n <= '0';
+        wait for SPI_CLK_HALF * 2;
+
+        -- 4. Transmit the Image (1156 Pixels)
+        file_open(f_in, DATA_DIR & TEST_IMAGE & "_0_input.hex", read_mode);
+        report "Streaming 1156 Image Words over SPI...";
+        
+        while not endfile(f_in) loop
+            readline(f_in, l);
+            hread(l, hex_val);
+            spi_transfer_16(hex_val, rx_word); -- Ignore rx_word during image send
+        end loop;
+        file_close(f_in);
+        
+        report "Transmission Complete. Waiting for FPGA DATA_READY...";
+
+        -- 5. Wait for CNN Inference (Timeout protection)
+        wait until data_ready = '1' for TIMEOUT;
+        if data_ready = '0' then
+            report "!!! FATAL ERROR: Timeout waiting for DATA_READY !!!" severity failure;
+        end if;
+        report "DATA_READY Interrupt Received! Reading 3 Class Logits...";
+
+        wait for SPI_CLK_HALF * 4;
+
+        -- 6. Read the 3 Output Logits (Cat, Dog, Human)
+        for i in 0 to 2 loop
+            spi_transfer_16(x"0000", rx_word);
+            received_logits(i) <= rx_word;
+        end loop;
+
+        -- 7. End Transaction
+        wait for SPI_CLK_HALF * 2;
+        spi_cs_n <= '1';
+        report "SPI Transaction Closed.";
+
+        -- 8. Bit-Exact Verification
+        report "==================================================";
+        report "--- VERIFICATION RESULTS ---";
+        for i in 0 to 2 loop
+            if received_logits(i) = expected_logits(i) then
+                report "Logit " & integer'image(i) & " MATCH! Expected/Received: " & to_hex_string(expected_logits(i));
+            else
+                report "Logit " & integer'image(i) & " MISMATCH! " & 
+                       " Expected: " & to_hex_string(expected_logits(i)) & 
+                       " Received: " & to_hex_string(received_logits(i)) severity error;
+                errors := errors + 1;
+            end if;
+        end loop;
+
+        report "==================================================";
+        if errors = 0 then
+            report " >>> SUCCESS: ALL LOGITS MATCH GOLDEN MODEL EXACTLY! <<< ";
+        else
+            report " >>> FAILURE: " & integer'image(errors) & " LOGIT(S) MISMATCHED <<< " severity error;
+        end if;
+        report "==================================================";
+
+        sim_done <= true;
+        wait;
+    end process;
+
+end architecture;
+\end{lstlisting}
+
+\subsection{nexys4_top.xdc}
+\begin{lstlisting}[language=Tcl]
+## ==============================================================================
+## FPGA-Accelerated CNN Inference - Master Constraints File
+## Target Board: Digilent Nexys 4 / Nexys A7 (Artix-7 XC7A100T)
+## ==============================================================================
+
+## ------------------------------------------------------------------------------
+## 1. System Clock (100 MHz Oscillator)
+## ------------------------------------------------------------------------------
+# Mapped to physical pin E3 (100MHz onboard oscillator)
+set_property -dict { PACKAGE_PIN E3    IOSTANDARD LVCMOS33 } [get_ports { clk_100mhz }];
+
+# Define the clock for the timing analyzer (10.00 ns period = 100 MHz)
+create_clock -add -name sys_clk_pin -period 10.00 -waveform {0 5} [get_ports { clk_100mhz }];
+
+
+## ------------------------------------------------------------------------------
+## 2. System Reset
+## ------------------------------------------------------------------------------
+# Mapped to the red CPU_RESET button (Active Low)
+set_property -dict { PACKAGE_PIN C12   IOSTANDARD LVCMOS33 } [get_ports { reset_n }];
+
+
+## ------------------------------------------------------------------------------
+## 3. SPI Communication Interface (PMOD JA)
+## ------------------------------------------------------------------------------
+# JA[1] - MOSI (Pi -> FPGA)
+set_property -dict { PACKAGE_PIN C17   IOSTANDARD LVCMOS33 } [get_ports { spi_mosi }];
+
+# JA[2] - MISO (FPGA -> Pi)
+set_property -dict { PACKAGE_PIN D18   IOSTANDARD LVCMOS33 } [get_ports { spi_miso }];
+
+# JA[3] - SCLK (Pi -> FPGA)
+set_property -dict { PACKAGE_PIN E18   IOSTANDARD LVCMOS33 } [get_ports { spi_sclk }];
+
+# JA[4] - CS_N / CE0 (Pi -> FPGA, Active Low)
+set_property -dict { PACKAGE_PIN G17   IOSTANDARD LVCMOS33 } [get_ports { spi_cs_n }];
+
+
+## ------------------------------------------------------------------------------
+## 4. Hardware Interrupt (PMOD JB)
+## ------------------------------------------------------------------------------
+# JB[1] - DATA_READY (FPGA -> Pi)
+set_property -dict { PACKAGE_PIN D14   IOSTANDARD LVCMOS33 } [get_ports { data_ready }];
+
+
+## ------------------------------------------------------------------------------
+## 5. Asynchronous Input Constraints
+## ------------------------------------------------------------------------------
+# Since spi_mosi, spi_sclk, spi_cs_n, and reset_n are external signals asynchronous 
+# to the 100MHz clock, we tell the timing analyzer to ignore the setup/hold times 
+# from the I/O pads to the first synchronizer flip-flops in spi_controller.vhd.
+set_false_path -from [get_ports { spi_mosi spi_sclk spi_cs_n reset_n }]
+
+
+## ------------------------------------------------------------------------------
+## 6. Hardware Debugger LEDs
+## ------------------------------------------------------------------------------
+# LEDs 15-12: FSM State | LED 11: RX FIFO Empty | LEDs 10-0: Pixel Count
+set_property -dict { PACKAGE_PIN H17   IOSTANDARD LVCMOS33 } [get_ports { led[0] }];
+set_property -dict { PACKAGE_PIN K15   IOSTANDARD LVCMOS33 } [get_ports { led[1] }];
+set_property -dict { PACKAGE_PIN J13   IOSTANDARD LVCMOS33 } [get_ports { led[2] }];
+set_property -dict { PACKAGE_PIN N14   IOSTANDARD LVCMOS33 } [get_ports { led[3] }];
+set_property -dict { PACKAGE_PIN R18   IOSTANDARD LVCMOS33 } [get_ports { led[4] }];
+set_property -dict { PACKAGE_PIN V17   IOSTANDARD LVCMOS33 } [get_ports { led[5] }];
+set_property -dict { PACKAGE_PIN U17   IOSTANDARD LVCMOS33 } [get_ports { led[6] }];
+set_property -dict { PACKAGE_PIN U16   IOSTANDARD LVCMOS33 } [get_ports { led[7] }];
+set_property -dict { PACKAGE_PIN V16   IOSTANDARD LVCMOS33 } [get_ports { led[8] }];
+set_property -dict { PACKAGE_PIN T15   IOSTANDARD LVCMOS33 } [get_ports { led[9] }];
+set_property -dict { PACKAGE_PIN U14   IOSTANDARD LVCMOS33 } [get_ports { led[10] }];
+set_property -dict { PACKAGE_PIN T16   IOSTANDARD LVCMOS33 } [get_ports { led[11] }];
+set_property -dict { PACKAGE_PIN V15   IOSTANDARD LVCMOS33 } [get_ports { led[12] }];
+set_property -dict { PACKAGE_PIN V14   IOSTANDARD LVCMOS33 } [get_ports { led[13] }];
+set_property -dict { PACKAGE_PIN V12   IOSTANDARD LVCMOS33 } [get_ports { led[14] }];
+set_property -dict { PACKAGE_PIN V11   IOSTANDARD LVCMOS33 } [get_ports { led[15] }];
+\end{lstlisting}
